@@ -1,0 +1,29 @@
+FROM ubuntu:24.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install required build tools, RDMA headers/libraries, Python, and remote execution tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    g++ \
+    gcc \
+    git \
+    jq \
+    nlohmann-json3-dev \
+    libibverbs-dev \
+    ibverbs-utils \
+    librdmacm-dev \
+    rdmacm-utils \
+    numactl \
+    valgrind \
+    python3 \
+    python3-pip \
+    openssh-client \
+    rsync \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Fixed neutral workdir; overridden at runtime by podman run -w
+WORKDIR /workspace
