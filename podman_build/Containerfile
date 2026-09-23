@@ -6,7 +6,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Install required build tools, RDMA headers/libraries, Python, and remote execution tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    ca-certificates \
     cmake \
+    curl \
     g++ \
     gcc \
     git \
@@ -22,8 +24,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     openssh-client \
     rsync \
-    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Rust toolchain, via rustup: the distro's rustc is too old for the 2024 edition
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal
 
 # Fixed neutral workdir; overridden at runtime by podman run -w
 WORKDIR /workspace
