@@ -8,8 +8,8 @@
 - `src/meta.rs` — the metadata channel: the TCP wire protocol (framing + messages) and `Channel`, plain `std::net` — the zero-dependency TCP choice, deliberate. No RDMA knowledge; both high-level sides drive it.
 - `src/rdma/` — low-level RDMA (`verbs.rs`: libibverbs + rdma_cm FFI). Confined to its own module so the implementation can be swapped for a different technology; `rdma/mod.rs` is the re-export seam.
 - `old_cpp_lib/` — older C++ implementation of the same ideas; read for semantics (`conn.cpp`, `remote_process/ops.cpp`), but it does more (TCP sync, pre-allocated buffers) — don't copy blindly.
-- `src/tests/` — unit tests (in-crate, they use private internals; not `tests/`). **Agent-owned**: run them to verify changes, modify them freely — they work locally, without RDMA hardware.
-- `tests/` — cluster integration tests (public API only), deployed to real nodes by `scripts/test_runner.py` (see below). `tests/common/mod.rs` is the shared helper module, `tests/_test_config.json` the machine-specific cluster config. **User-owned**: do not execute or modify them unless explicitly asked.
+- `src/tests/` — **inner tests**, agent-owned: unit tests and small tests that run locally, in the container, without RDMA hardware (they may use private internals; not `tests/`). Run them to verify changes, modify them freely. Anything that needs a real node — the full flow over RDMA, HPC runs — is an **outer test** and belongs in `tests/`, never here.
+- `tests/` — **outer tests**: cluster integration tests (public API only), deployed to real nodes by `scripts/test_runner.py` (see below). `tests/common/mod.rs` is the shared helper module, `tests/_test_config.json` the machine-specific cluster config. **User-owned**: for humans only — do not execute or modify them unless explicitly asked.
 
 ## Commands
 
