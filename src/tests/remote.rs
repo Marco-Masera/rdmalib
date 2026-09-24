@@ -1,7 +1,8 @@
+use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
 
-use crate::readers::CachedRegion;
+use crate::readers::{CachedRegion, GroupConnection};
 use crate::*;
 
 fn metadata(name: &str, id: u32, size: usize) -> RemoteMemoryRegionMetadata {
@@ -9,6 +10,25 @@ fn metadata(name: &str, id: u32, size: usize) -> RemoteMemoryRegionMetadata {
         name: name.into(),
         id,
         size,
+        elem_size: 1,
+        elem_align: 1,
+        elem_type: "u8".into(),
+    }
+}
+
+/// A region of 4096 bytes at 0x1000, shared as elements of the given
+/// layout, with no session behind it: its reads fail for want of the
+/// group's RDMA connection, not for bad input.
+fn region(elem_size: u32, elem_align: u32, elem_type: &str) -> RemoteMemoryRegion {
+    RemoteMemoryRegion {
+        connection: Rc::new(RefCell::new(GroupConnection::empty())),
+        remote_addr: 0x1000,
+        size: 4096,
+        rkey: 1,
+        group: 0,
+        elem_size,
+        elem_align,
+        elem_type: elem_type.into(),
     }
 }
 
@@ -17,7 +37,9 @@ fn provider_starts_empty() {
     let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
     assert!(provider.get_remote_mr_metadata().is_empty());
     assert!(provider.get_remote_mr(&metadata("missing", 0, 0), None).is_none());
-    provider.update();
+    // Nothing connects until an update, and an update without a
+    // reachable remote fails here.
+    assert!(provider.update(0).is_err());
 }
 
 #[test]
@@ -33,12 +55,18 @@ fn lookup_by_metadata_and_group() {
                 size: 4096,
                 rkey: 1,
                 group: 0,
+                elem_size: 1,
+                elem_align: 1,
+                elem_type: "u8".into(),
             },
             CachedRegion {
                 remote_addr: 0x2000,
                 size: 8192,
                 rkey: 2,
                 group: 3,
+                elem_size: 8,
+                elem_align: 8,
+                elem_type: "u64".into(),
             },
         ],
     );
@@ -51,6 +79,7 @@ fn lookup_by_metadata_and_group() {
         (grouped.remote_addr, grouped.size, grouped.rkey, grouped.group),
         (0x2000, 8192, 2, 3)
     );
+    assert_eq!((grouped.elem_size, grouped.elem_align), (8, 8));
 
     assert!(provider.get_remote_mr(&heap, Some(7)).is_none());
     // Same name, different id: a different region.
@@ -60,14 +89,7 @@ fn lookup_by_metadata_and_group() {
 
 #[test]
 fn read_bounds_are_checked_before_connecting() {
-    let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::new("127.0.0.1", 1, 2));
-    let region = RemoteMemoryRegion {
-        connection: Rc::clone(&provider.connection),
-        remote_addr: 0x1000,
-        size: 4096,
-        rkey: 1,
-        group: 0,
-    };
+    let region = region(1, 1, "u8");
     let mut buf = [0u8; 8];
 
     // Beyond the region's end.
@@ -81,14 +103,7 @@ fn read_bounds_are_checked_before_connecting() {
 
 #[test]
 fn typed_read_bounds_and_alignment_are_checked_before_connecting() {
-    let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::new("127.0.0.1", 1, 2));
-    let region = RemoteMemoryRegion {
-        connection: Rc::clone(&provider.connection),
-        remote_addr: 0x1000,
-        size: 4096,
-        rkey: 1,
-        group: 0,
-    };
+    let region = region(4, 4, "u32");
 
     // 8 bytes of u32s at offset 4090 exceed the 4096-byte region.
     assert_eq!(
@@ -107,11 +122,37 @@ fn typed_read_bounds_and_alignment_are_checked_before_connecting() {
         io::ErrorKind::InvalidInput
     );
 
-    // In bounds and aligned, the checks pass — this one fails later,
-    // connecting: there is no RDMA stack here and nothing listening
-    // there, but the error is no longer an input error.
+    // In bounds, aligned, and of the registered element layout — this
+    // one fails later, for want of the group's connection: there is
+    // no RDMA stack here and no session has run, but the error is no
+    // longer an input error.
     assert_ne!(
         region.read_typed::<u32>(0, 4).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn typed_mismatch_with_the_registered_layout_is_rejected() {
+    // A region shared as u64s.
+    let region = region(8, 8, "u64");
+
+    // A u32 view of it: layout mismatch, rejected before any read is
+    // attempted — with both type names in the error.
+    let err = region.read_typed::<u32>(0, 2).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    let msg = err.to_string();
+    assert!(msg.contains("u64"), "{msg}");
+    assert!(msg.contains("u32"), "{msg}");
+
+    let mut buf = [0u32; 2];
+    assert_eq!(
+        region.read_into_typed(0, &mut buf).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    // The matching type still passes the layout check.
+    assert_ne!(
+        region.read_typed::<u64>(0, 1).unwrap_err().kind(),
         io::ErrorKind::InvalidInput
     );
 }

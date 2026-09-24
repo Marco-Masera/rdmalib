@@ -33,8 +33,8 @@
 //! let tuple = mr.tuple(); // (remote_addr, size, rkey) for the reader
 //!
 //! // Reader: connect and read into a locally registered buffer.
-//! // (In practice the tuple travels over the metadata channel, which
-//! // is not implemented yet.)
+//! // (In practice the tuple travels over the metadata channel — see
+//! // the high-level API.)
 //! let conn = Connection::connect("10.0.0.1:18515").unwrap();
 //! let dst = vec![0u8; 4096];
 //! let dst_mr = conn.register(&dst).unwrap();

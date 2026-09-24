@@ -1,0 +1,40 @@
+{
+  "base_ports": {
+    "TCP": 8100,
+    "RDMA": 9100
+  },
+  "nodes": [
+    {
+        "id": 0,
+        "hostname": "node1",
+        "ip": "192.168.4.1"
+    },
+    {
+        "id": 1,
+        "hostname": "node3",
+        "ip": "192.168.4.3"
+    },
+    {
+        "id": 2,
+        "hostname": "node4",
+        "ip": "192.168.4.4"
+    },
+    {
+        "id": 3,
+        "hostname": "node5",
+        "ip": "192.168.4.5"
+    },
+    {
+        "id": 4,
+        "hostname": "node7",
+        "ip": "192.168.4.7"
+    }
+  ],
+  "remote_path": "/home/maserm/throwaway",
+
+  "tests": {
+    "read_test": {
+      "nodes": [0, 1]
+    }
+  }
+}

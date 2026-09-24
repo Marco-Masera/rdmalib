@@ -1,0 +1,2 @@
+[target.'cfg(all())']
+runner = ["python3", "scripts/test_runner.py"]

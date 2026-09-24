@@ -5,13 +5,18 @@
 //! and `rdma/rdma_cma.h` (ABI-stable up to the declared fields);
 //! undeclared trailing fields are never touched. Linking requires
 //! `libibverbs` and `librdmacm`.
+//!
+//! The handle types are `Send` but deliberately not `Sync`: the
+//! wrapped C objects have no thread affinity, so a handle can move
+//! between threads, while exclusive ownership keeps a single object
+//! used by one thread at a time.
 
 use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs};
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// RDMA port space used by the connections: TCP-style, reliable.
@@ -455,6 +460,11 @@ pub struct MemoryRegion {
     rkey: u32,
 }
 
+// SAFETY: the wrapped registration has no thread affinity, so moving
+// it to another thread is sound; access stays serialized by
+// ownership, which is why `Sync` is deliberately not implemented.
+unsafe impl Send for MemoryRegion {}
+
 impl MemoryRegion {
     /// Address of the region in this machine's address space, as seen
     /// by remote readers.
@@ -515,7 +525,7 @@ impl fmt::Debug for MemoryRegion {
 /// handle.
 #[derive(Clone)]
 pub struct ProtectionDomain {
-    inner: Rc<PdInner>,
+    inner: Arc<PdInner>,
 }
 
 struct PdInner {
@@ -523,12 +533,21 @@ struct PdInner {
     pd: *mut IbvPd,
 }
 
+// SAFETY: the wrapped domain has no thread affinity, and the verbs
+// API permits concurrent use of one protection domain from several
+// threads; destruction stays exclusive, by the `Arc` refcount. This
+// is what lets clones of the handle live on different threads — and
+// why the handle must stay on `Arc`, whose atomic refcount that
+// relies on.
+unsafe impl Send for PdInner {}
+unsafe impl Sync for PdInner {}
+
 impl ProtectionDomain {
     /// Allocate a domain on `context`'s device.
     fn alloc(context: *mut IbvContext) -> io::Result<Self> {
         let pd = check_ptr("ibv_alloc_pd", unsafe { ibv_alloc_pd(context) })?;
         Ok(Self {
-            inner: Rc::new(PdInner { context, pd }),
+            inner: Arc::new(PdInner { context, pd }),
         })
     }
 
@@ -618,8 +637,8 @@ impl fmt::Debug for ProtectionDomain {
 /// the memory registered in it work through the domain's connections,
 /// so connections sharing a domain (a group of readers) share access.
 ///
-/// Operations are synchronous and the type is single-threaded
-/// (neither `Send` nor `Sync`).
+/// Operations are synchronous; like every handle of this module the
+/// type is `Send` but not `Sync`.
 pub struct Connection {
     /// The communication identifier.
     id: *mut RdmaCmId,
@@ -635,6 +654,13 @@ pub struct Connection {
     /// Work request ids, to match completions in [`Connection::read`].
     next_wr_id: Cell<u64>,
 }
+
+// SAFETY: the wrapped connection has no thread affinity (its `Cell`
+// is `Send`, its domain handle now is too), so moving it to another
+// thread is sound; access stays serialized by ownership, and `Sync`
+// is deliberately not implemented — concurrent reads of one
+// connection are not part of the contract.
+unsafe impl Send for Connection {}
 
 impl Connection {
     /// Connect to the remote machine listening at `addr`.
@@ -887,6 +913,11 @@ pub struct Listener {
     id: *mut RdmaCmId,
     event_channel: *mut RdmaEventChannel,
 }
+
+// SAFETY: the wrapped listener has no thread affinity, so moving it
+// to another thread is sound; accepting remains serialized by
+// ownership (`Sync` deliberately not implemented).
+unsafe impl Send for Listener {}
 
 impl Listener {
     /// Bind to `addr` and listen for RDMA connection requests.

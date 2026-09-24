@@ -7,11 +7,14 @@
 //! as raw bytes or, without copying, as vectors of any [`RemoteSafe`]
 //! type — types whose every bit pattern is valid, since remote
 //! machines write arbitrary bytes into them. Reads and tuple creation
-//! use the low-level layer, and the metadata exchange over TCP is
-//! still to come.
+//! use the low-level layer; the metadata exchange between the two
+//! sides travels over TCP — [`RemoteMemoryProvider::update`] runs a
+//! group's session on the reader side, and the provider serves it
+//! from a background thread ([`SharedMemoryRegionProvider::serve`]).
 
 pub mod rdma;
 
+mod meta;
 mod pod;
 mod providers;
 mod readers;

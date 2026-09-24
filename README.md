@@ -5,7 +5,41 @@ Provides abstraction to RDMA primitives for Rust applications.
 
 
 # Usage 
-TODO
+
+Both sides exchange metadata over TCP; the data itself travels over
+RDMA, with no copies on either side. Both nodes define the same
+shared type (they are separately compiled — the library checks the
+element layout, the type identity is the developer's responsibility):
+
+```rust
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Test {
+    v: usize,
+}
+rdmalib::impl_remote_safe!(Test);
+```
+
+Node 1 creates the array and shares it:
+
+```rust
+let owner = rdmalib::SharedMemoryRegionProvider::new(
+    rdmalib::SharedMemoryRegionProviderAddr::new(18515, 9917)); // RDMA, TCP ports
+let handle = owner.register_typed("tests", vec![Test { v: 1 }, Test { v: 2 }, Test { v: 3 }]);
+owner.serve()?; // binds both ports, serves readers in the background
+```
+
+Node 2 runs a session and reads the array and its values:
+
+```rust
+let reader = rdmalib::RemoteMemoryProvider::new(
+    rdmalib::RemoteMemoryProviderAddr::new("node1", 18515, 9917));
+reader.update(0)?; // session: greet, join group 0, RDMA rendezvous, tuples
+let catalog = reader.get_remote_mr_metadata();
+let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
+let tests = region.read_typed::<Test>(0, 3)?; // [Test { v: 1 }, Test { v: 2 }, Test { v: 3 }]
+assert_eq!(tests.iter().map(|t| t.v).collect::<Vec<_>>(), vec![1, 2, 3]);
+```
 
 ## Word-level alignment
 
