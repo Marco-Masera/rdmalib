@@ -2,7 +2,7 @@
 //!
 //! [`RemoteMemoryProvider`] connects to a remote
 //! [`SharedMemoryRegionProvider`](crate::SharedMemoryRegionProvider)
-//! and hands out [`RemoteMemoryRegion`]s to read from.
+//! and hands out [`RemoteMemoryRegion`]s to read from and write to.
 //! [`RemoteMemoryProvider::update`] runs a group's session over the
 //! metadata channel — greeting, joining the group, connecting over
 //! RDMA (which the remote accepts into the group's protection
@@ -146,12 +146,13 @@ pub struct RemoteMemoryRegionMetadata {
 /// An active memory region on the remote machine, as returned by
 /// [`RemoteMemoryProvider::get_remote_mr`].
 ///
-/// Reads go through the RDMA connection of the region's group —
-/// established by that group's
+/// Reads and writes go through the RDMA connection of the region's
+/// group — established by that group's
 /// [`RemoteMemoryProvider::update`] — as bytes ([`Self::read`],
-/// [`Self::read_into`]) or as elements of any [`RemoteSafe`] type
-/// ([`Self::read_typed`], [`Self::read_into_typed`]), provided that is
-/// the type the sharing side registered the region as.
+/// [`Self::read_into`], [`Self::write`]) or as elements of any
+/// [`RemoteSafe`] type ([`Self::read_typed`], [`Self::read_into_typed`],
+/// [`Self::write_typed`]), provided that is the type the sharing side
+/// registered the region as.
 #[derive(Debug, Clone)]
 pub struct RemoteMemoryRegion {
     /// The group's RDMA connection slot, shared with the provider's
@@ -270,6 +271,75 @@ impl RemoteMemoryRegion {
         let connection = slot.get()?;
         let mr = connection.register_addr(buf.as_mut_ptr() as u64, size)?;
         connection.read(&mr, self.remote_addr + byte_offset, self.rkey, size)
+    }
+
+    /// Write `buf` to the remote region starting at byte `offset`,
+    /// modifying the remote memory in place.
+    ///
+    /// The write must stay within the region: `offset + buf.len()` may
+    /// not exceed the region's size.
+    ///
+    /// TODO: every write registers and deregisters its buffer; reuse
+    /// registered memory once performance matters.
+    pub fn write(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        if offset.saturating_add(buf.len() as u64) > self.size as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "write of {} bytes at offset {offset} exceeds the region of {} bytes",
+                    buf.len(),
+                    self.size
+                ),
+            ));
+        }
+
+        let slot = self.connection.borrow();
+        let connection = slot.get()?;
+        let mr = connection.register_addr(buf.as_ptr() as u64, buf.len())?;
+        connection.write(&mr, self.remote_addr + offset, self.rkey, buf.len())
+    }
+
+    /// Write `buf` to the remote region starting at element `offset`,
+    /// modifying the remote memory in place.
+    ///
+    /// The same `T` and element-unit rules as [`Self::read_typed`]:
+    /// `T` must be the element type the sharing side registered the
+    /// region as, and `offset` and `buf.len()` are in elements of `T`;
+    /// the write must stay within the region. For byte offsets, use
+    /// [`Self::write`].
+    ///
+    /// TODO: every write registers and deregisters its buffer; reuse
+    /// registered memory once performance matters.
+    pub fn write_typed<T: RemoteSafe>(&self, offset: u64, buf: &[T]) -> io::Result<()> {
+        self.check_elem::<T>()?;
+        let elem = size_of::<T>() as u64;
+        let byte_offset = offset.saturating_mul(elem);
+        let size = size_of_val(buf);
+        if byte_offset.saturating_add(size as u64) > self.size as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "write of {} elements at element offset {offset} exceeds the region of {} elements of {} bytes",
+                    buf.len(),
+                    self.size / size_of::<T>(),
+                    size_of::<T>()
+                ),
+            ));
+        }
+        if !(self.remote_addr + byte_offset).is_multiple_of(align_of::<T>() as u64) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "write at element offset {offset} is misaligned for elements of alignment {}",
+                    align_of::<T>()
+                ),
+            ));
+        }
+
+        let slot = self.connection.borrow();
+        let connection = slot.get()?;
+        let mr = connection.register_addr(buf.as_ptr() as u64, size)?;
+        connection.write(&mr, self.remote_addr + byte_offset, self.rkey, size)
     }
 
     /// Reject a `T` whose layout is not the layout the region is

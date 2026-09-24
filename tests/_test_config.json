@@ -41,6 +41,9 @@
     },
     "test_access_from_large_array":{
       "nodes": [0, 1]
+    },
+    "read_write_test":{
+      "nodes": [0, 1]
     }
   }
 }

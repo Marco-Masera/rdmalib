@@ -12,7 +12,8 @@
 //!   equivalents), which registers a local buffer for remote access
 //!   and produces the (remote_addr, size, rkey) tuple remote readers
 //!   need;
-//! - one-sided reads, via [`Connection::read`].
+//! - one-sided reads and writes, via [`Connection::read`] and
+//!   [`Connection::write`].
 //!
 //! The implementation is technology-specific and confined to a single
 //! module; the current one is built on libibverbs and rdma_cm.
@@ -39,6 +40,11 @@
 //! let dst = vec![0u8; 4096];
 //! let dst_mr = conn.register(&dst).unwrap();
 //! conn.read(&dst_mr, tuple.0, tuple.2, 4096).unwrap();
+//!
+//! // Writing back works the same way, source buffer first.
+//! let src = vec![0u8; 4096];
+//! let src_mr = conn.register(&src).unwrap();
+//! conn.write(&src_mr, tuple.0, tuple.2, 4096).unwrap();
 //! ```
 
 mod verbs;

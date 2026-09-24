@@ -38,8 +38,11 @@ const LISTEN_BACKLOG: c_int = 16;
 /// Address family of [`SockaddrIn`].
 const AF_INET: u16 = 2;
 
-// QP type and work request constants (from `infiniband/verbs.h`).
+// QP type and work request constants (from `infiniband/verbs.h`):
+// `IBV_WR_RDMA_WRITE` is the first entry of `enum ibv_wr_opcode`,
+// `IBV_WR_RDMA_READ` the fifth.
 const IBV_QPT_RC: c_int = 2;
+const IBV_WR_RDMA_WRITE: c_int = 0;
 const IBV_WR_RDMA_READ: c_int = 4;
 const IBV_SEND_SIGNALED: c_uint = 1 << 1;
 
@@ -445,7 +448,8 @@ fn wait_event(channel: *mut RdmaEventChannel, expected: c_int, step: &str) -> io
 /// Registering a buffer on a [`Connection`] pins it for RDMA access
 /// from that connection: the tuple (remote_addr, size, rkey) tells
 /// remote readers how to reach it, and `lkey` authorizes local
-/// operations, such as the destination buffer of a read.
+/// operations, such as the destination buffer of a read or the source
+/// of a write.
 ///
 /// Dropping the region deregisters it. Safety contracts: the buffer
 /// must outlive the region without moving or being resized, and the
@@ -799,12 +803,45 @@ impl Connection {
     /// [`POLL_TIMEOUT`] elapses. Out-of-bounds reads are detected by
     /// the remote machine and fail with a remote access error.
     pub fn read(&self, mr: &MemoryRegion, remote_addr: u64, rkey: u32, len: usize) -> io::Result<()> {
+        self.one_sided("read", IBV_WR_RDMA_READ, mr, remote_addr, rkey, len)
+    }
+
+    /// Write the first `len` bytes of `mr`, a region registered in
+    /// this connection's protection domain, to `remote_addr` of the
+    /// remote machine, accessed with `rkey`.
+    ///
+    /// Synchronous: blocks until the write completes or
+    /// [`POLL_TIMEOUT`] elapses. The remote memory must be registered
+    /// for remote writes — every region the high-level providers
+    /// share is — and out-of-bounds writes are detected by the remote
+    /// machine and fail with a remote access error.
+    pub fn write(&self, mr: &MemoryRegion, remote_addr: u64, rkey: u32, len: usize) -> io::Result<()> {
+        self.one_sided("write", IBV_WR_RDMA_WRITE, mr, remote_addr, rkey, len)
+    }
+
+    /// Post one one-sided RDMA operation and wait for its completion.
+    ///
+    /// `opcode` picks the operation ([`IBV_WR_RDMA_READ`] or
+    /// [`IBV_WR_RDMA_WRITE`]); `op` names it in error messages. The
+    /// first `len` bytes of `mr` are the operation's local end — the
+    /// destination of a read, the source of a write — and
+    /// `remote_addr`, accessed with `rkey`, its remote end; `mr` must
+    /// be registered in this connection's protection domain.
+    fn one_sided(
+        &self,
+        op: &str,
+        opcode: c_int,
+        mr: &MemoryRegion,
+        remote_addr: u64,
+        rkey: u32,
+        len: usize,
+    ) -> io::Result<()> {
         if len == 0 {
-            return Err(invalid("cannot read zero bytes"));
+            return Err(invalid(format!("cannot {op} zero bytes")));
         }
         if len > mr.size {
             return Err(invalid(format!(
-                "read of {len} bytes exceeds the registered region of {} bytes",
+                "{op} of {len} bytes exceeds the registered region of {} bytes",
                 mr.size
             )));
         }
@@ -826,7 +863,7 @@ impl Connection {
             next: std::ptr::null_mut(),
             sg_list: &mut sge,
             num_sge: 1,
-            opcode: IBV_WR_RDMA_READ,
+            opcode,
             send_flags: IBV_SEND_SIGNALED,
             imm_data: 0,
             wr: SendWrOp {
@@ -843,9 +880,9 @@ impl Connection {
             unsafe { post_send(qp, &mut send_wr, &mut bad_wr) },
         )?;
 
-        // Wait for this read's completion, skipping stale ones (e.g.
-        // left by a read that timed out). ibv_poll_cq is a static
-        // inline call in verbs.h, dispatched like ibv_post_send.
+        // Wait for this operation's completion, skipping stale ones
+        // (e.g. left by an operation that timed out). ibv_poll_cq is a
+        // static inline call in verbs.h, dispatched like ibv_post_send.
         let poll_cq = unsafe { (*(*self.cq).context).ops.poll_cq };
         let deadline = Instant::now() + POLL_TIMEOUT;
         let mut wc: IbvWc = unsafe { std::mem::zeroed() };
@@ -857,7 +894,7 @@ impl Connection {
             if ret == 1 && wc.wr_id == wr_id {
                 if wc.status != IBV_WC_SUCCESS {
                     return Err(io::Error::other(format!(
-                        "RDMA read failed: {} (vendor error {})",
+                        "RDMA {op} failed: {} (vendor error {})",
                         status_str(wc.status),
                         wc.vendor_err
                     )));
@@ -867,7 +904,7 @@ impl Connection {
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "timed out waiting for the RDMA read completion",
+                    format!("timed out waiting for the RDMA {op} completion"),
                 ));
             }
         }

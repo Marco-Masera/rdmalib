@@ -176,3 +176,100 @@ fn typed_mismatch_with_the_registered_layout_is_rejected() {
         io::ErrorKind::InvalidInput
     );
 }
+
+#[test]
+fn write_bounds_are_checked_before_connecting() {
+    let region = region(1, 1, "u8");
+
+    // Beyond the region's end.
+    assert_eq!(
+        region.write(4090, &[0u8; 8]).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    // In bounds, but no session has run: the failure is for want of
+    // the group's connection, not bad input.
+    assert_ne!(
+        region.write(0, &[0u8; 16]).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    // An empty write at the end offset stays in bounds — like
+    // `vec[4096..4096]` — and fails later, for want of the connection.
+    assert_ne!(
+        region.write(4096, &[]).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn typed_write_bounds_and_alignment_are_checked_before_connecting() {
+    let region = region(4, 4, "u32");
+
+    // 2 u32s at element offset 1023 (bytes 4092..4100) exceed the
+    // 4096-byte region.
+    assert_eq!(
+        region.write_typed::<u32>(1023, &[0u32; 2]).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    // A misaligned region base (0x1002 here) is rejected for u32
+    // elements: element offsets themselves are always aligned.
+    let misaligned = RemoteMemoryRegion {
+        connection: Rc::new(RefCell::new(GroupConnection::empty())),
+        remote_addr: 0x1002,
+        size: 4096,
+        rkey: 1,
+        group: 0,
+        elem_size: 4,
+        elem_align: 4,
+        elem_type: "u32".into(),
+    };
+    assert_eq!(
+        misaligned.write_typed::<u32>(0, &[0u32; 1]).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    // A whole-buffer typed write of 2048 u32s exceeds the region.
+    assert_eq!(
+        region.write_typed::<u32>(0, &[0u32; 2048]).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    // An element offset past the region's end, even with nothing to
+    // write. (An empty write at the end offset, 1024, stays in bounds
+    // — like `vec[1024..1024]` — and fails later, for want of the
+    // connection.)
+    assert_eq!(
+        region.write_typed::<u32>(1025, &[]).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert_ne!(
+        region.write_typed::<u32>(1024, &[]).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+
+    // In bounds and of the registered element layout — this one fails
+    // later, for want of the group's connection: there is no RDMA
+    // stack here and no session has run, but the error is no longer
+    // an input error. Element offset 1 = bytes 4..8.
+    assert_ne!(
+        region.write_typed::<u32>(1, &[0u32; 1]).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn typed_write_mismatch_with_the_registered_layout_is_rejected() {
+    // A region shared as u64s.
+    let region = region(8, 8, "u64");
+
+    // A u32 view of it: layout mismatch, rejected before any write is
+    // attempted — with both type names in the error.
+    let err = region.write_typed::<u32>(0, &[0u32; 2]).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    let msg = err.to_string();
+    assert!(msg.contains("u64"), "{msg}");
+    assert!(msg.contains("u32"), "{msg}");
+    // The matching type passes the layout check and fails later, for
+    // want of the connection.
+    assert_ne!(
+        region.write_typed::<u64>(0, &[0u64; 1]).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+}

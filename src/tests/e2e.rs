@@ -61,3 +61,57 @@ fn reader_reads_what_the_owner_shares() {
     handle.borrow_mut()[1] = 99;
     assert_eq!(region.read_typed::<u64>(1, 1).unwrap(), vec![99]);
 }
+
+/// The write path of the same flow: the reader writes into the shared
+/// region over RDMA, and both sides see the bytes. Needs RDMA
+/// hardware — run with `cargo test -- --ignored`.
+#[test]
+#[ignore = "needs an RDMA device"]
+fn reader_writes_what_the_owner_shares() {
+    // Owner: share a region and start the metadata service. Ports of
+    // its own, so this runs back-to-back with the read test above.
+    const RDMA_PORT: u16 = 18516;
+    const TCP_PORT: u16 = 9918;
+    let owner = SharedMemoryRegionProvider::new(SharedMemoryRegionProviderAddr::new(
+        RDMA_PORT,
+        TCP_PORT,
+    ));
+    let handle = owner.register_typed("commands", vec![0u64, 0, 0, 0]);
+    owner.serve().unwrap();
+
+    // Reader: join group 0 and write into the region, element-wise
+    // over RDMA.
+    let reader = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::new(
+        "localhost",
+        RDMA_PORT,
+        TCP_PORT,
+    ));
+    reader.update(0).unwrap();
+    let catalog = reader.get_remote_mr_metadata();
+    let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
+
+    region.write_typed::<u64>(1, &[7, 8]).unwrap();
+    // The owner sees the written elements...
+    assert_eq!(&*handle.borrow(), &[0, 7, 8, 0]);
+    // ...and so does the reader, reading them back.
+    assert_eq!(region.read_typed::<u64>(1, 2).unwrap(), vec![7, 8]);
+
+    // The byte view: a raw write of the first element's bytes.
+    region.write(0, &13u64.to_ne_bytes()).unwrap();
+    assert_eq!(&*handle.borrow(), &[13, 7, 8, 0]);
+    assert_eq!(region.read(0, 8).unwrap(), 13u64.to_ne_bytes());
+
+    // Bounds and layout are checked before the device is touched.
+    assert_eq!(
+        region.write_typed::<u64>(3, &[0u64; 2]).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        region.write_typed::<u32>(0, &[0u32; 2]).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        region.write(31, &[0u8; 8]).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+}
