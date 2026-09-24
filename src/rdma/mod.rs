@@ -2,11 +2,15 @@
 //!
 //! The primitive operations the rest of the library is built on:
 //!
-//! - connection creation, via [`Connection::connect`] (reader side) and
-//!   [`Listener::bind`] + [`Listener::accept`] (provider side);
-//! - tuple creation, via [`Connection::register`], which registers a
-//!   local buffer for remote access and produces the (remote_addr,
-//!   size, rkey) tuple remote readers need;
+//! - connection creation, via [`Connection::connect`] (reader side)
+//!   and [`Listener::bind`] + [`Listener::accept`] /
+//!   [`Listener::accept_into`] (provider side; connections sharing a
+//!   [`ProtectionDomain`] share the rkeys of the memory registered in
+//!   it, which is how a group of readers gets shared access);
+//! - tuple creation, via [`ProtectionDomain::register`] (or
+//!   [`Connection::register`] on a connection's domain), which
+//!   registers a local buffer for remote access and produces the
+//!   (remote_addr, size, rkey) tuple remote readers need;
 //! - one-sided reads, via [`Connection::read`].
 //!
 //! The implementation is technology-specific and confined to a single
@@ -38,4 +42,4 @@
 
 mod verbs;
 
-pub use verbs::{Connection, Listener, MemoryRegion};
+pub use verbs::{Connection, Listener, MemoryRegion, ProtectionDomain};

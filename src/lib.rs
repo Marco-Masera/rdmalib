@@ -270,31 +270,31 @@ impl SharedMemoryRegionProviderAddr {
 /// Serves the memory regions shared with remote machines.
 ///
 /// Constructed from a [`SharedMemoryRegionProviderAddr`]. Readers
-/// connect to the RDMA port and are accepted one at a time with
-/// [`Self::accept`], each getting its own group. Regions are
-/// registered with [`Self::register`], which takes ownership of their
-/// buffer and assigns them an id. (remote_addr, size, rkey) tuples are
-/// created lazily by [`Self::get_shared_mr`], one per (region, group)
-/// pair: the region's buffer is registered on the group's connection,
-/// so the rkey is a real one. The TCP channel for the metadata
-/// exchange does not exist yet.
+/// connect to the RDMA port and are accepted one at a time into a
+/// group of the owner's choosing with [`Self::accept`]: the readers of
+/// a group share one protection domain, and with it the rkey of each
+/// tuple. Regions are registered with [`Self::register`], which takes
+/// ownership of their buffer and assigns them an id. (remote_addr,
+/// size, rkey) tuples are created lazily by [`Self::get_shared_mr`],
+/// one per (region, group) pair, and shared by all of the group's
+/// readers. The TCP channel for the metadata exchange does not exist
+/// yet.
 #[derive(Debug)]
 pub struct SharedMemoryRegionProvider {
     addr: SharedMemoryRegionProviderAddr,
     /// Tuples by (region id, group): the registration of each region's
-    /// buffer on a reader's connection, kept alive until the provider
-    /// is dropped.
+    /// buffer in a group's protection domain, kept alive until the
+    /// provider is dropped.
     tuples: RefCell<HashMap<(u32, u32), rdma::MemoryRegion>>,
     /// Registered regions by id. This lock guards only the catalog:
     /// buffers live in per-region RefCells shared with the handles, so a
     /// buffer can be borrowed while the provider keeps working.
     regions: RefCell<HashMap<u32, RegionEntry>>,
-    /// Accepted reader connections by group id.
-    connections: RefCell<HashMap<u32, Rc<rdma::Connection>>>,
+    /// Accepted reader groups by group id.
+    groups: RefCell<HashMap<u32, GroupEntry>>,
     /// The listener, bound on the first [`Self::accept`].
     listener: RefCell<Option<rdma::Listener>>,
     next_id: Cell<u32>,
-    next_group: Cell<u32>,
 }
 
 /// Handle to a region registered with a [`SharedMemoryRegionProvider`].
@@ -329,6 +329,19 @@ struct RegionEntry {
     size: usize,
 }
 
+/// Internal bookkeeping for one group of readers: they share the
+/// group's protection domain, so they share the rkeys of the tuples
+/// created for the group.
+#[derive(Debug)]
+struct GroupEntry {
+    /// The group's protection domain, created with the group's first
+    /// accepted connection; the queue pairs of all the group's
+    /// connections live in it.
+    pd: rdma::ProtectionDomain,
+    /// The group's accepted reader connections.
+    connections: Vec<rdma::Connection>,
+}
+
 impl SharedMemoryRegionProvider {
     /// Create a provider serving memory over `addr`'s RDMA port and
     /// exchanging metadata over its TCP port.
@@ -337,24 +350,26 @@ impl SharedMemoryRegionProvider {
             addr,
             tuples: RefCell::new(HashMap::new()),
             regions: RefCell::new(HashMap::new()),
-            connections: RefCell::new(HashMap::new()),
+            groups: RefCell::new(HashMap::new()),
             listener: RefCell::new(None),
             next_id: Cell::new(0),
-            next_group: Cell::new(0),
         }
     }
 
-    /// Accept a connection from a remote reader, and assign it a fresh
-    /// group id.
+    /// Accept a connection from a remote reader into `group`, creating
+    /// the group on first use.
     ///
-    /// Blocks until a reader connects. The listener is bound on the
-    /// first call, on the provider's RDMA port with a wildcard address
-    /// (across the node's RDMA devices). The returned group identifies
-    /// the reader in [`Self::get_shared_mr`] requests.
+    /// Blocks until a reader connects. The group's protection domain
+    /// is created with its first connection and shared by all of its
+    /// connections, so every reader in the group can use the tuples
+    /// created for it. The listener is bound on the first call, on the
+    /// provider's RDMA port with a wildcard address (across the node's
+    /// RDMA devices); a reader arriving on a different device than its
+    /// group's domain is rejected.
     ///
     /// TODO: once the metadata exchange is implemented, readers arrive
     /// with their metadata requests over the TCP channel.
-    pub fn accept(&self) -> io::Result<u32> {
+    pub fn accept(&self, group: u32) -> io::Result<()> {
         if self.listener.borrow().is_none() {
             let listener = rdma::Listener::bind(SocketAddrV4::new(
                 Ipv4Addr::UNSPECIFIED,
@@ -362,18 +377,28 @@ impl SharedMemoryRegionProvider {
             ))?;
             *self.listener.borrow_mut() = Some(listener);
         }
-        let connection = self
-            .listener
-            .borrow()
-            .as_ref()
-            .expect("the listener is bound")
-            .accept()?;
-        let group = self.next_group.get();
-        self.next_group.set(group + 1);
-        self.connections
-            .borrow_mut()
-            .insert(group, Rc::new(connection));
-        Ok(group)
+
+        // The group's domain, if the group already has readers.
+        let group_pd = self.groups.borrow().get(&group).map(|g| g.pd.clone());
+        let connection = {
+            let listener = self.listener.borrow();
+            let listener = listener.as_ref().expect("the listener is bound");
+            match group_pd {
+                Some(pd) => listener.accept_into(&pd)?,
+                None => listener.accept()?,
+            }
+        };
+
+        let mut groups = self.groups.borrow_mut();
+        groups
+            .entry(group)
+            .or_insert_with(|| GroupEntry {
+                pd: connection.protection_domain(),
+                connections: Vec::new(),
+            })
+            .connections
+            .push(connection);
+        Ok(())
     }
 
     /// Take ownership of `metadata` and assign the region a fresh id.
@@ -411,12 +436,13 @@ impl SharedMemoryRegionProvider {
     /// The (remote_addr, size, rkey) tuple of region `id` for `group`,
     /// created on first request.
     ///
-    /// Creating a tuple registers the region's buffer on the group's
-    /// connection: the rkey is a real one, usable by that reader, and
-    /// the registration is kept alive for as long as the provider is.
-    /// Repeated requests for the same region and group return the same
-    /// tuple; registration errors are reported as `Err`; unknown region
-    /// ids or groups return `Ok(None)`.
+    /// Creating a tuple registers the region's buffer in the group's
+    /// protection domain: the rkey is a real one, usable by every
+    /// reader of the group, and the registration is kept alive for as
+    /// long as the provider is. Repeated requests for the same region
+    /// and group return the same tuple; registration errors are
+    /// reported as `Err`; unknown region ids or groups return
+    /// `Ok(None)`.
     ///
     /// This is the data that will be served through the TCP channel.
     /// The buffer is never touched here: its address and size were
@@ -427,7 +453,12 @@ impl SharedMemoryRegionProvider {
             return Ok(Some((mr.addr(), mr.size(), mr.rkey())));
         }
 
-        let Some(connection) = self.connections.borrow().get(&group).cloned() else {
+        let Some(pd) = self
+            .groups
+            .borrow()
+            .get(&group)
+            .map(|entry| entry.pd.clone())
+        else {
             return Ok(None);
         };
         let Some((remote_addr, size)) = self
@@ -439,7 +470,7 @@ impl SharedMemoryRegionProvider {
             return Ok(None);
         };
 
-        let mr = connection.register_addr(remote_addr, size)?;
+        let mr = pd.register_addr(remote_addr, size)?;
         let tuple = (mr.addr(), mr.size(), mr.rkey());
         self.tuples.borrow_mut().insert((id, group), mr);
         Ok(Some(tuple))
@@ -448,8 +479,8 @@ impl SharedMemoryRegionProvider {
 
 impl Drop for SharedMemoryRegionProvider {
     /// Deregister the tuples while the buffers they pin and the
-    /// connections (whose protection domains the registrations belong
-    /// to) are still alive.
+    /// groups (whose protection domains the registrations belong to)
+    /// are still alive.
     fn drop(&mut self) {
         self.tuples.borrow_mut().clear();
     }

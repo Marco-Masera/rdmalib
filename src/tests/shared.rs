@@ -14,14 +14,16 @@ fn register_assigns_sequential_ids() {
 }
 
 #[test]
-fn tuples_need_an_accepted_connection() {
+fn tuples_need_an_accepted_group() {
     let provider = provider();
     let handle = provider.register(SharedMemoryRegionMetadata::new("heap", vec![0u8; 4096]));
 
-    // No reader has been accepted, so no group exists: no tuple is
-    // served. (Creating real tuples requires RDMA hardware, exercised
-    // on the cluster machines: the tuple of a region and group is the
-    // registration of the region's buffer on the group's connection.)
+    // No reader has been accepted into group 0, so no group exists
+    // yet: no tuple is served. (Creating real tuples requires RDMA
+    // hardware, exercised on the cluster machines: the tuple of a
+    // region and group is the registration of the region's buffer in
+    // the group's protection domain, shared by all of the group's
+    // readers.)
     assert!(provider.get_shared_mr(handle.id(), 0).unwrap().is_none());
     assert!(provider.get_shared_mr(99, 0).unwrap().is_none());
 }

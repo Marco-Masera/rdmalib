@@ -11,6 +11,7 @@ use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 /// RDMA port space used by the connections: TCP-style, reliable.
@@ -499,24 +500,135 @@ impl fmt::Debug for MemoryRegion {
     }
 }
 
+/// A protection domain: the verbs scope in which memory regions are
+/// registered and queue pairs are created.
+///
+/// Connections created in the same domain share the rkeys of the
+/// memory registered in it: that is how a group of readers gets
+/// access to the same memory with one registration. A domain belongs
+/// to a single device; accepting a connection through another
+/// device's listener into it fails.
+///
+/// Cloning a handle shares the domain; it is destroyed once the last
+/// handle, connection, and registration are gone. Safety contract:
+/// registrations ([`MemoryRegion`]) must be dropped before the last
+/// handle.
+#[derive(Clone)]
+pub struct ProtectionDomain {
+    inner: Rc<PdInner>,
+}
+
+struct PdInner {
+    context: *mut IbvContext,
+    pd: *mut IbvPd,
+}
+
+impl ProtectionDomain {
+    /// Allocate a domain on `context`'s device.
+    fn alloc(context: *mut IbvContext) -> io::Result<Self> {
+        let pd = check_ptr("ibv_alloc_pd", unsafe { ibv_alloc_pd(context) })?;
+        Ok(Self {
+            inner: Rc::new(PdInner { context, pd }),
+        })
+    }
+
+    /// The raw handle, for the FFI calls of this module.
+    fn raw(&self) -> *mut IbvPd {
+        self.inner.pd
+    }
+
+    /// The device the domain belongs to.
+    fn context(&self) -> *mut IbvContext {
+        self.inner.context
+    }
+
+    /// Register the memory at `addr`..`addr + size` in this protection
+    /// domain.
+    ///
+    /// Returns the registered [`MemoryRegion`], as [`Self::register`].
+    /// Use this for memory whose address and size are tracked
+    /// separately from a Rust borrow, as the high-level providers do:
+    /// the memory must stay valid and unmoved while the region is
+    /// alive, but no Rust reference to it needs to exist while it is
+    /// being registered. The rkey is usable through every connection
+    /// of this domain.
+    pub fn register_addr(&self, addr: u64, size: usize) -> io::Result<MemoryRegion> {
+        if size == 0 {
+            return Err(invalid("cannot register an empty region"));
+        }
+        let mr = check_ptr(
+            "ibv_reg_mr",
+            unsafe {
+                ibv_reg_mr(
+                    self.inner.pd,
+                    addr as *mut c_void,
+                    size,
+                    IBV_ACCESS_LOCAL_WRITE
+                        | IBV_ACCESS_REMOTE_WRITE
+                        | IBV_ACCESS_REMOTE_READ
+                        | IBV_ACCESS_REMOTE_ATOMIC,
+                )
+            },
+        )?;
+        let (lkey, rkey) = unsafe { ((*mr).lkey, (*mr).rkey) };
+        Ok(MemoryRegion {
+            mr,
+            pd: self.inner.pd,
+            addr,
+            size,
+            lkey,
+            rkey,
+        })
+    }
+
+    /// Register `buffer` in this protection domain.
+    ///
+    /// Returns the registered [`MemoryRegion`]: its [`MemoryRegion::tuple`]
+    /// is what remote readers need to access the buffer remotely; its
+    /// [`MemoryRegion::lkey`] is what local operations require. The
+    /// buffer may be modified remotely at any time while registered,
+    /// through every connection of this domain.
+    ///
+    /// The buffer must outlive the returned region without moving or
+    /// being resized: drop the region first.
+    pub fn register(&self, buffer: &[u8]) -> io::Result<MemoryRegion> {
+        self.register_addr(buffer.as_ptr() as u64, buffer.len())
+    }
+}
+
+impl Drop for PdInner {
+    fn drop(&mut self) {
+        unsafe { ibv_dealloc_pd(self.pd) };
+    }
+}
+
+impl fmt::Debug for ProtectionDomain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The raw handle is enough to tell domains apart.
+        f.debug_struct("ProtectionDomain")
+            .field("pd", &self.inner.pd)
+            .finish()
+    }
+}
+
 /// An established RDMA connection to a remote machine.
 ///
 /// Created by [`Connection::connect`] or accepted by a [`Listener`].
-/// Each connection owns its protection domain, so the rkeys of the
-/// regions registered on it are connection-specific: two readers
-/// obtain different tuples for the same buffer. This is the
-/// connection-level counterpart of the "group" concept of the
-/// high-level providers.
+/// Each connection belongs to a [`ProtectionDomain`]: the rkeys of
+/// the memory registered in it work through the domain's connections,
+/// so connections sharing a domain (a group of readers) share access.
 ///
 /// Operations are synchronous and the type is single-threaded
 /// (neither `Send` nor `Sync`).
 pub struct Connection {
     /// The communication identifier.
     id: *mut RdmaCmId,
-    /// Resources, created during the handshake; null until then, so
-    /// that a connection whose setup failed drops cleanly.
+    /// Resources, created during the handshake; the queue-less/null
+    /// state lets a connection whose setup failed drop cleanly.
     cq: *mut IbvCq,
-    pd: *mut IbvPd,
+    /// The protection domain, shared with the connection's group;
+    /// absent until the resources are created.
+    pd: Option<ProtectionDomain>,
     /// Event channel owned by this connection; accepted connections
     /// share the listener's channel and leave this null.
     event_channel: *mut RdmaEventChannel,
@@ -536,7 +648,7 @@ impl Connection {
         let mut conn = Self {
             id: std::ptr::null_mut(),
             cq: std::ptr::null_mut(),
-            pd: std::ptr::null_mut(),
+            pd: None,
             event_channel,
             next_wr_id: Cell::new(0),
         };
@@ -576,18 +688,18 @@ impl Connection {
             RDMA_CM_EVENT_ROUTE_RESOLVED,
             "rdma_resolve_route",
         )?;
-        self.create_resources()?;
+        let context = unsafe { (*self.id).verbs };
+        let pd = ProtectionDomain::alloc(context)?;
+        self.create_resources(pd)?;
         let mut param = conn_param();
         check("rdma_connect", unsafe { rdma_connect(self.id, &mut param) })?;
         wait_event(self.event_channel, RDMA_CM_EVENT_ESTABLISHED, "rdma_connect")
     }
 
-    /// Allocate the protection domain, completion queue, and queue
-    /// pair on the device this connection is bound to.
-    fn create_resources(&mut self) -> io::Result<()> {
+    /// Create the completion queue and the queue pair on this
+    /// connection's device, in `pd`.
+    fn create_resources(&mut self, pd: ProtectionDomain) -> io::Result<()> {
         let context = unsafe { (*self.id).verbs };
-        let pd = check_ptr("ibv_alloc_pd", unsafe { ibv_alloc_pd(context) })?;
-        self.pd = pd;
         let cq = check_ptr(
             "ibv_create_cq",
             unsafe { ibv_create_cq(context, CQ_SIZE, std::ptr::null_mut(), std::ptr::null_mut(), 0) },
@@ -611,63 +723,39 @@ impl Connection {
             qp_type: IBV_QPT_RC,
             sq_sig_all: 1,
         };
-        check("rdma_create_qp", unsafe { rdma_create_qp(self.id, pd, &mut attr) })
-    }
-
-    /// Register the memory at `addr`..`addr + size` for RDMA access on
-    /// this connection.
-    ///
-    /// Returns the registered [`MemoryRegion`], as [`Self::register`].
-    /// Use this for memory whose address and size are tracked
-    /// separately from a Rust borrow, as the high-level providers do:
-    /// the memory must stay valid and unmoved while the region is
-    /// alive, but no Rust reference to it needs to exist while it is
-    /// being registered.
-    pub fn register_addr(&self, addr: u64, size: usize) -> io::Result<MemoryRegion> {
-        if size == 0 {
-            return Err(invalid("cannot register an empty region"));
-        }
-        let mr = check_ptr(
-            "ibv_reg_mr",
-            unsafe {
-                ibv_reg_mr(
-                    self.pd,
-                    addr as *mut c_void,
-                    size,
-                    IBV_ACCESS_LOCAL_WRITE
-                        | IBV_ACCESS_REMOTE_WRITE
-                        | IBV_ACCESS_REMOTE_READ
-                        | IBV_ACCESS_REMOTE_ATOMIC,
-                )
-            },
+        check(
+            "rdma_create_qp",
+            unsafe { rdma_create_qp(self.id, pd.raw(), &mut attr) },
         )?;
-        let (lkey, rkey) = unsafe { ((*mr).lkey, (*mr).rkey) };
-        Ok(MemoryRegion {
-            mr,
-            pd: self.pd,
-            addr,
-            size,
-            lkey,
-            rkey,
-        })
+        self.pd = Some(pd);
+        Ok(())
     }
 
-    /// Register `buffer` for RDMA access on this connection.
+    /// The connection's protection domain: memory registered in it is
+    /// accessible through this connection and any other connection
+    /// created in the same domain (see [`Listener::accept_into`]).
+    pub fn protection_domain(&self) -> ProtectionDomain {
+        self.pd.clone().expect("the connection is established")
+    }
+
+    /// Register `buffer` for RDMA access in this connection's
+    /// protection domain.
     ///
     /// Returns the registered [`MemoryRegion`]: its [`MemoryRegion::tuple`]
     /// is what remote readers need to access the buffer remotely; its
     /// [`MemoryRegion::lkey`] is what local operations require. The
-    /// buffer may be modified remotely at any time while registered.
+    /// buffer may be modified remotely at any time while registered,
+    /// through every connection of the domain.
     ///
     /// The buffer must outlive the returned region without moving or
     /// being resized: drop the region first.
     pub fn register(&self, buffer: &[u8]) -> io::Result<MemoryRegion> {
-        self.register_addr(buffer.as_ptr() as u64, buffer.len())
+        self.protection_domain().register(buffer)
     }
 
     /// Read `len` bytes at `remote_addr` of the remote machine,
     /// accessed with `rkey`, into the first `len` bytes of `mr`, a
-    /// region registered on this connection.
+    /// region registered in this connection's protection domain.
     ///
     /// Synchronous: blocks until the read completes or
     /// [`POLL_TIMEOUT`] elapses. Out-of-bounds reads are detected by
@@ -682,9 +770,10 @@ impl Connection {
                 mr.size
             )));
         }
-        if mr.pd != self.pd {
+        let pd = self.pd.as_ref().expect("the connection is established");
+        if mr.pd != pd.raw() {
             return Err(invalid(
-                "the memory region is registered on another connection",
+                "the memory region is registered in another protection domain",
             ));
         }
 
@@ -750,7 +839,9 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         // Best effort: disconnected or never-connected ids return an
-        // error, which is ignored here.
+        // error, which is ignored here. The shared protection domain
+        // (a struct field) drops after this, deallocating the domain
+        // once its last connection and registration are gone.
         unsafe {
             if !self.id.is_null() {
                 if !(*self.id).qp.is_null() {
@@ -761,9 +852,6 @@ impl Drop for Connection {
             }
             if !self.cq.is_null() {
                 ibv_destroy_cq(self.cq);
-            }
-            if !self.pd.is_null() {
-                ibv_dealloc_pd(self.pd);
             }
             if !self.event_channel.is_null() {
                 rdma_destroy_event_channel(self.event_channel);
@@ -824,12 +912,29 @@ impl Listener {
         }
     }
 
-    /// Block until a connection request arrives, and accept it.
+    /// Block until a connection request arrives, and accept it,
+    /// creating the connection's own protection domain.
     ///
     /// Creates the connection resources on the requested device, then
     /// accepts. The established event of an accepted connection is
     /// reported on this listener's event channel.
     pub fn accept(&self) -> io::Result<Connection> {
+        self.accept_impl(None)
+    }
+
+    /// Block until a connection request arrives, and accept it into
+    /// the shared protection domain `pd`.
+    ///
+    /// The queue pair is created in `pd`, so the rkeys of the memory
+    /// registered in it work through this connection too: this is how
+    /// the connections of one group share access. Fails, releasing
+    /// the connection, if it arrives on a different device than the
+    /// one `pd` belongs to.
+    pub fn accept_into(&self, pd: &ProtectionDomain) -> io::Result<Connection> {
+        self.accept_impl(Some(pd))
+    }
+
+    fn accept_impl(&self, pd: Option<&ProtectionDomain>) -> io::Result<Connection> {
         let mut event: *mut RdmaCmEvent = std::ptr::null_mut();
         check(
             "rdma_get_cm_event",
@@ -848,13 +953,25 @@ impl Listener {
         let mut conn = Connection {
             id: child,
             cq: std::ptr::null_mut(),
-            pd: std::ptr::null_mut(),
+            pd: None,
             // The child id shares this listener's event channel, which
             // this connection must not destroy.
             event_channel: std::ptr::null_mut(),
             next_wr_id: Cell::new(0),
         };
-        conn.create_resources()?;
+
+        let context = unsafe { (*child).verbs };
+        let pd = match pd {
+            // Dropping conn here releases the rejected connection.
+            Some(pd) if pd.context() != context => {
+                return Err(io::Error::other(
+                    "rdma accept_into: the connection arrived on a different device than the protection domain",
+                ));
+            }
+            Some(pd) => pd.clone(),
+            None => ProtectionDomain::alloc(context)?,
+        };
+        conn.create_resources(pd)?;
         let mut param = conn_param();
         check("rdma_accept", unsafe { rdma_accept(conn.id, &mut param) })?;
         wait_event(self.event_channel, RDMA_CM_EVENT_ESTABLISHED, "rdma_accept")?;
