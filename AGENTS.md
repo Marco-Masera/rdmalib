@@ -31,7 +31,8 @@
 - Tuple creation must **not touch the buffer** (the app may hold a `borrow_mut`): that is why registration uses `ProtectionDomain::register_addr(addr, size)` with the address captured at `register()` time, not a slice. Buffers are never resized after registration — the handle API only exposes slices.
 - The remote side connects **lazily on the first read**, so `RemoteMemoryProvider::new` stays infallible and tests run without hardware.
 - Drop order matters: ibv registrations (tuples) must be deregistered before their connections (PDs) are destroyed — `Drop for SharedMemoryRegionProvider` clears the tuples map first; don't reorder fields/teardown.
+- Typed sharing (`register_typed`, typed handle borrows, `read_typed`) goes through the **`RemoteSafe` unsafe trait** (`src/pod.rs`): the implementer asserts every bit pattern is a valid `T` (`#[repr(C)]`, no bool/char/enums/refs — remote writers produce arbitrary bytes). Buffers are stored **type-erased** (`Rc<RefCell<Box<dyn Any>>>`, shared entry↔handle) and borrows downcast to `&[T]` — never transmute the `Vec` itself (wrong-layout dealloc). Verbs only ever sees the byte (addr, size) captured at registration. Type agreement between the separately compiled sides is the user's responsibility; reader-side typed reads still check bounds and remote-address alignment before connecting.
 
 ## Not implemented yet
 
-TCP metadata exchange (`update()` is a no-op; the remote caches stay empty until then), IPv6, write/atomic verbs, async post+poll reads, reuse of registered destination buffers for reads.
+TCP metadata exchange (`update()` is a no-op; the remote caches stay empty until then; it should also carry the element type/layout so typed mismatches can be detected), IPv6, write/atomic verbs, async post+poll reads, reuse of registered destination buffers for reads.

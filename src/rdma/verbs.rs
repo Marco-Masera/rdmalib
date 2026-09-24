@@ -753,6 +753,18 @@ impl Connection {
         self.protection_domain().register(buffer)
     }
 
+    /// Register the memory at `addr`..`addr + size` in this
+    /// connection's protection domain.
+    ///
+    /// As [`ProtectionDomain::register_addr`], for buffers whose
+    /// address and size are tracked separately from a Rust borrow:
+    /// the memory must stay valid and unmoved while the region is
+    /// alive, but no Rust reference to it needs to exist while it is
+    /// being registered or read into.
+    pub fn register_addr(&self, addr: u64, size: usize) -> io::Result<MemoryRegion> {
+        self.protection_domain().register_addr(addr, size)
+    }
+
     /// Read `len` bytes at `remote_addr` of the remote machine,
     /// accessed with `rkey`, into the first `len` bytes of `mr`, a
     /// region registered in this connection's protection domain.
