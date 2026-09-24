@@ -216,16 +216,16 @@ impl RemoteMemoryRegion {
         connection.read(&mr, self.remote_addr + offset, self.rkey, size)
     }
 
-    /// Read `count` elements starting at byte `offset` from the remote
-    /// region, allocating and returning a new `Vec` of them.
+    /// Read `count` elements starting at element `offset` from the
+    /// remote region, allocating and returning a new `Vec` of them.
     ///
     /// `T` must be the element type the sharing side registered the
     /// region as: its size and alignment travel with the region, and a
     /// `T` that does not match fails here instead of reading garbage —
     /// though type identity across separately compiled applications
-    /// still cannot be verified, only the layout. The read must stay
-    /// within the region, and `offset` must be a multiple of `T`'s
-    /// alignment.
+    /// still cannot be verified, only the layout. Both `offset` and
+    /// `count` are in elements of `T`; the read must stay within the
+    /// region. For byte offsets, use [`Self::read`].
     ///
     /// TODO: every read registers and deregisters its buffer; reuse
     /// registered memory once performance matters.
@@ -235,30 +235,32 @@ impl RemoteMemoryRegion {
         Ok(buffer)
     }
 
-    /// Read `buf.len()` elements starting at byte `offset` into `buf`,
-    /// without allocating new memory.
+    /// Read `buf.len()` elements starting at element `offset` into
+    /// `buf`, without allocating new memory.
     ///
-    /// The same `T`, bounds, and alignment rules as
+    /// The same `T`, bounds, and element-unit rules as
     /// [`Self::read_typed`]; a partial read is a shorter `buf` slice.
     pub fn read_into_typed<T: RemoteSafe>(&self, offset: u64, buf: &mut [T]) -> io::Result<()> {
         self.check_elem::<T>()?;
+        let elem = size_of::<T>() as u64;
+        let byte_offset = offset.saturating_mul(elem);
         let size = size_of_val(buf);
-        if offset.saturating_add(size as u64) > self.size as u64 {
+        if byte_offset.saturating_add(size as u64) > self.size as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "read of {} elements of {} bytes at offset {offset} exceeds the region of {} bytes",
+                    "read of {} elements at element offset {offset} exceeds the region of {} elements of {} bytes",
                     buf.len(),
-                    size_of::<T>(),
-                    self.size
+                    self.size / size_of::<T>(),
+                    size_of::<T>()
                 ),
             ));
         }
-        if !(self.remote_addr + offset).is_multiple_of(align_of::<T>() as u64) {
+        if !(self.remote_addr + byte_offset).is_multiple_of(align_of::<T>() as u64) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "read at offset {offset} is misaligned for elements of alignment {}",
+                    "read at element offset {offset} is misaligned for elements of alignment {}",
                     align_of::<T>()
                 ),
             ));
@@ -267,7 +269,7 @@ impl RemoteMemoryRegion {
         let slot = self.connection.borrow();
         let connection = slot.get()?;
         let mr = connection.register_addr(buf.as_mut_ptr() as u64, size)?;
-        connection.read(&mr, self.remote_addr + offset, self.rkey, size)
+        connection.read(&mr, self.remote_addr + byte_offset, self.rkey, size)
     }
 
     /// Reject a `T` whose layout is not the layout the region is

@@ -105,14 +105,26 @@ fn read_bounds_are_checked_before_connecting() {
 fn typed_read_bounds_and_alignment_are_checked_before_connecting() {
     let region = region(4, 4, "u32");
 
-    // 8 bytes of u32s at offset 4090 exceed the 4096-byte region.
+    // 2 u32s at element offset 1023 (bytes 4092..4100) exceed the
+    // 4096-byte region.
     assert_eq!(
-        region.read_typed::<u32>(4090, 2).unwrap_err().kind(),
+        region.read_typed::<u32>(1023, 2).unwrap_err().kind(),
         io::ErrorKind::InvalidInput
     );
-    // Offset 2 is misaligned for u32 elements at a 0x1000 region.
+    // A misaligned region base (0x1002 here) is rejected for u32
+    // elements: element offsets themselves are always aligned.
+    let misaligned = RemoteMemoryRegion {
+        connection: Rc::new(RefCell::new(GroupConnection::empty())),
+        remote_addr: 0x1002,
+        size: 4096,
+        rkey: 1,
+        group: 0,
+        elem_size: 4,
+        elem_align: 4,
+        elem_type: "u32".into(),
+    };
     assert_eq!(
-        region.read_typed::<u32>(2, 1).unwrap_err().kind(),
+        misaligned.read_typed::<u32>(0, 1).unwrap_err().kind(),
         io::ErrorKind::InvalidInput
     );
     // A whole-buffer typed read of 2048 u32s exceeds the region.
@@ -121,13 +133,21 @@ fn typed_read_bounds_and_alignment_are_checked_before_connecting() {
         region.read_into_typed(0, &mut buf).unwrap_err().kind(),
         io::ErrorKind::InvalidInput
     );
+    // An element offset past the region's end, even with nothing to
+    // read. (An empty read at the end offset, 1024, stays in bounds —
+    // like `vec[1024..1024]` — and only fails later, for want of the
+    // connection.)
+    assert_eq!(
+        region.read_typed::<u32>(1025, 0).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
 
-    // In bounds, aligned, and of the registered element layout — this
-    // one fails later, for want of the group's connection: there is
-    // no RDMA stack here and no session has run, but the error is no
-    // longer an input error.
+    // In bounds and of the registered element layout — this one fails
+    // later, for want of the group's connection: there is no RDMA
+    // stack here and no session has run, but the error is no longer
+    // an input error. Element offset 1 = bytes 4..8.
     assert_ne!(
-        region.read_typed::<u32>(0, 4).unwrap_err().kind(),
+        region.read_typed::<u32>(1, 1).unwrap_err().kind(),
         io::ErrorKind::InvalidInput
     );
 }

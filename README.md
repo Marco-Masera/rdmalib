@@ -77,16 +77,17 @@ is at least 8** — plus word-aligned offsets:
    you) — every element boundary stays word-aligned. A 12-byte struct
    can only exist because its alignment is ≤ 4.
 3. **Use offsets that are multiples of 8.** With an 8-aligned base,
-   those are the absolute word boundaries. For typed reads the offset
-   is in bytes: element `i` starts at `i * size_of::<T>()`, already a
-   multiple of 8 given the two rules above.
+    those are the absolute word boundaries. For typed reads the offset
+    is in elements: element `i` starts at `i * size_of::<T>()`, already
+    a multiple of 8 given the two rules above.
 
 For typed reads, the library double-checks rule 3:
-[`read_typed`](src/readers.rs) and `read_into_typed` reject any
-`(region base + offset)` not aligned to `align_of::<T>()`, so with an
-8-aligned `T` the typed API cannot express a misaligned access. That
-is a safety net against accidents, not an atomicity mechanism — the
-byte-level `read`/`read_into` accept any offset and size.
+[`read_typed`](src/readers.rs) and `read_into_typed` reject a region
+base not aligned to `align_of::<T>()` (element offsets always land on
+element boundaries), so with an 8-aligned `T` the typed API cannot
+express a misaligned access. That is a safety net against accidents,
+not an atomicity mechanism — the byte-level `read`/`read_into` accept
+any offset and size.
 
 ### The buffer is exactly the elements
 
@@ -114,6 +115,6 @@ rdmalib::impl_remote_safe!(Reading);
 // Provider side: the base is 8-aligned, elements are 16 bytes apart.
 let handle = provider.register_typed("readings", vec![Reading { timestamp: 0, value: 0.0 }; 100]);
 
-// Reader side: offset in bytes, a multiple of 8 — here, element 3.
-let r = region.read_typed::<Reading>(3 * 16, 1)?;
+// Reader side: offset in elements — here, element 3.
+let r = region.read_typed::<Reading>(3, 1)?;
 ```

@@ -59,5 +59,5 @@ fn reader_reads_what_the_owner_shares() {
 
     // The owner keeps writing; the reader sees it.
     handle.borrow_mut()[1] = 99;
-    assert_eq!(region.read_typed::<u64>(8, 1).unwrap(), vec![99]);
+    assert_eq!(region.read_typed::<u64>(1, 1).unwrap(), vec![99]);
 }

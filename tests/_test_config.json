@@ -35,6 +35,9 @@
   "tests": {
     "read_test": {
       "nodes": [0, 1]
+    },
+    "test_access_from_large_array":{
+      "nodes": [0, 1]
     }
   }
 }
