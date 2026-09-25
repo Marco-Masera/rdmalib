@@ -1,12 +1,9 @@
-// Cluster integration test: the runner (scripts/test_runner.py) deploys
-// this binary to the nodes configured for `byte_read_test` in
-// tests/_test_config.json and tells each process the cluster layout via
-// environment variables (parsed in tests/common/mod.rs).
-//
-// The byte-flavored sibling of read_test.rs: node0 shares a raw byte
-// buffer (no element type), the readers read it back — whole, and in
-// slices at byte offsets — and node0 rewrites part of it for a second
-// round of reads.
+/*
+ * Bytes Read Test
+ *  - One writer and one reader setting
+ *  - The reader accesses the remote memory as a simple buffer of bytes,
+ *    with no semantic meaning attached.
+ */
 
 mod common;
 

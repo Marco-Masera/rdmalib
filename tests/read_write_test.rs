@@ -1,7 +1,10 @@
-// Cluster integration test: the runner (scripts/test_runner.py) deploys
-// this binary to the nodes configured for `read_test` in
-// tests/_test_config.json and tells each process the cluster layout via
-// environment variables (parsed in tests/common/mod.rs).
+/*
+ * Read Write Test
+ *  - One writer and one reader-writer setting
+ *  - The reader accesses the remote memory as an array of Structs of type Test
+ *  - Switch roles: The reader then modifies the memory and send the write over rdma
+ *  - The original writer becomes the reader and checks changes in its local memory
+ */
 
 mod common;
 

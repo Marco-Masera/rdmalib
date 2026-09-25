@@ -1,7 +1,9 @@
-// Cluster integration test: the runner (scripts/test_runner.py) deploys
-// this binary to the nodes configured for `read_test` in
-// tests/_test_config.json and tells each process the cluster layout via
-// environment variables (parsed in tests/common/mod.rs).
+/*
+ * Read Write Test with large buffer - Disaggregated memory setting
+ *  - One writer and one reader setting
+ *  - The writer initializes and share a large array
+ *  - The reader accesses a small portions of it
+ */
 
 mod common;
 
