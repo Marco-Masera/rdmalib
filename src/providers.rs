@@ -26,8 +26,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::meta::{Channel, Message, RegionDesc, TupleDesc, PROTOCOL_VERSION};
+use crate::os;
 use crate::rdma;
-use crate::RemoteSafe;
+use crate::{Engine, RemoteSafe};
 
 /// A memory region to be shared with remote machines, as raw bytes.
 ///
@@ -104,6 +105,9 @@ type Owner = Rc<RefCell<Box<dyn Any>>>;
 #[derive(Debug)]
 pub struct SharedMemoryRegionProvider {
     addr: SharedMemoryRegionProviderAddr,
+    /// The CPU the service thread pins itself to, when [`Self::serve`]
+    /// starts it; `None` leaves it unpinned.
+    cpu: Option<u32>,
     /// The state shared with the service thread: everything the
     /// metadata channel serves, and everything it needs to serve it.
     shared: Shared,
@@ -192,9 +196,13 @@ impl SharedMemoryRegionProvider {
     /// Create a provider serving memory over `addr`'s RDMA port and
     /// exchanging metadata over its TCP port, once [`Self::serve`] is
     /// called.
+    ///
+    /// The service thread runs unpinned; to pin it to a CPU, use
+    /// [`Self::with_cpu`].
     pub fn new(addr: SharedMemoryRegionProviderAddr) -> Self {
         Self {
             addr,
+            cpu: None,
             shared: Shared {
                 catalog: Arc::new(Mutex::new(HashMap::new())),
                 groups: Arc::new(Mutex::new(HashMap::new())),
@@ -204,6 +212,37 @@ impl SharedMemoryRegionProvider {
             service: RefCell::new(None),
             next_id: Cell::new(0),
         }
+    }
+
+    /// Create a provider whose service thread pins itself to `cpu`
+    /// when [`Self::serve`] starts it.
+    ///
+    /// `cpu` is validated against this process's affinity mask at
+    /// `serve` time — an unusable CPU fails there, before any port is
+    /// bound. Only the service thread (the listeners and the readers'
+    /// rendezvous) is pinned; the per-session update threads stay
+    /// unpinned. This is the affinity half of the engine the async
+    /// operations design builds on (see `docs/async_engine.md`): a
+    /// provider issues no one-sided operations, so it has no use for
+    /// an operation-polling engine, only for the CPU placement.
+    pub fn with_cpu(addr: SharedMemoryRegionProviderAddr, cpu: u32) -> Self {
+        let mut provider = Self::new(addr);
+        provider.cpu = Some(cpu);
+        provider
+    }
+
+    /// Create a provider whose service thread pins itself to the CPU
+    /// of `engine` when [`Self::serve`] starts it.
+    ///
+    /// A provider issues no one-sided operations, so it has no use
+    /// for the engine's polling — only for its CPU placement: the
+    /// service thread takes the engine's pin (none, for an unpinned
+    /// engine), validated at `serve` time exactly as
+    /// [`Self::with_cpu`]'s.
+    pub fn with_engine(addr: SharedMemoryRegionProviderAddr, engine: Engine) -> Self {
+        let mut provider = Self::new(addr);
+        provider.cpu = engine.cpu();
+        provider
     }
 
     /// Bind the provider's ports and serve readers in the background.
@@ -235,6 +274,13 @@ impl SharedMemoryRegionProvider {
                 "the provider is already serving",
             ));
         }
+        // Validate the CPU before any port is bound: the check reads
+        // this thread's affinity mask — the mask the spawned service
+        // thread inherits — so a CPU usable here is one the service
+        // thread can pin to.
+        if let Some(cpu) = self.cpu {
+            os::ensure_cpu_available(cpu)?;
+        }
         let tcp = TcpListener::bind((Ipv4Addr::UNSPECIFIED, self.addr.tcp_port))?;
         let rdma_listener = rdma::Listener::bind(SocketAddrV4::new(
             Ipv4Addr::UNSPECIFIED,
@@ -244,6 +290,7 @@ impl SharedMemoryRegionProvider {
         let shutdown = Arc::new(AtomicBool::new(false));
         let service = Service {
             shutdown: Arc::clone(&shutdown),
+            cpu: self.cpu,
             tcp,
             rdma: rdma_listener,
             shared: self.shared.clone(),
@@ -499,6 +546,9 @@ struct Service {
     /// Signals the service and its sessions to stop; the provider's
     /// drop sets it.
     shutdown: Arc<AtomicBool>,
+    /// The CPU the service pinned itself to at startup, when
+    /// [`SharedMemoryRegionProvider::with_cpu`] requested one.
+    cpu: Option<u32>,
     /// The metadata listener, on the provider's TCP port.
     tcp: TcpListener,
     /// The RDMA listener, on the provider's RDMA port; every
@@ -514,6 +564,15 @@ struct Service {
 impl Service {
     /// Accept readers until shutdown, one rendezvous at a time.
     fn run(mut self) {
+        // Pin this thread to its CPU first: affinity is a per-thread
+        // attribute, and the CPU was validated when the service
+        // started, on the spawning thread's identical mask. A failure
+        // here (a race against the process's affinity changing) leaves
+        // the service unpinned but working, and there is no one left to
+        // report it to — so it is best effort.
+        if let Some(cpu) = self.cpu {
+            let _ = os::pin_current_thread(cpu);
+        }
         // Polling accept: closing a listener does not reliably wake a
         // blocked accept on Linux, but the flag is checked between
         // attempts.

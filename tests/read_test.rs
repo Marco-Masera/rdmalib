@@ -74,13 +74,21 @@ fn test_public_api() {
         reader.update(0).unwrap(); // session: greet, join group 0, RDMA rendezvous, tuples
         let catalog = reader.get_remote_mr_metadata();
         let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
-        let tests = region.read_typed::<Test>(0, 3).unwrap(); // [Test { v: 1 }, Test { v: 2 }, Test { v: 3 }]
+        let tests = region
+            .read_typed_async::<Test>(0, 3)
+            .unwrap()
+            .wait()
+            .unwrap(); // [Test { v: 1 }, Test { v: 2 }, Test { v: 3 }]
         assert_eq!(tests.iter().map(|t| t.v).collect::<Vec<_>>(), vec![1, 2, 3]);
         println!("Done!");
         // Done reading: let node0 tear the provider down.
         synch.synch().unwrap();
         synch.synch().unwrap();
-        let tests2 = region.read_typed::<Test>(0, 3).unwrap();
+        let tests2 = region
+            .read_typed_async::<Test>(0, 3)
+            .unwrap()
+            .wait()
+            .unwrap();
         assert_eq!(
             tests2.iter().map(|t| t.v).collect::<Vec<_>>(),
             vec![42, 2, 3]

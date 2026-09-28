@@ -1,6 +1,7 @@
 //! The full flow over the real stack: sharing a region, exchanging
-//! its metadata over TCP, and reading it back over RDMA. These need
-//! RDMA hardware — run them on a cluster node with
+//! its metadata over TCP, and reading it back over RDMA — through the
+//! operations engine, whose thread posts and polls everything. These
+//! need RDMA hardware — run them on a cluster node with
 //! `cargo test -- --ignored`.
 
 use crate::*;
@@ -21,7 +22,9 @@ fn reader_reads_what_the_owner_shares() {
     owner.serve().unwrap();
 
     // Reader: join group 0 and read the region back, element by
-    // element over RDMA.
+    // element over RDMA, through the engine. Two operations are
+    // submitted before either is waited on: they overlap, completing
+    // concurrently on the engine's thread.
     let reader = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::new(
         "localhost",
         RDMA_PORT,
@@ -30,17 +33,27 @@ fn reader_reads_what_the_owner_shares() {
     reader.update(0).unwrap();
     let catalog = reader.get_remote_mr_metadata();
     assert_eq!(catalog.len(), 1);
-    assert_eq!((catalog[0].name.as_str(), catalog[0].id), ("readings", handle.id()));
-    assert_eq!((catalog[0].elem_size, catalog[0].elem_align, catalog[0].elem_type.as_str()), (8, 8, "u64"));
+    assert_eq!(catalog[0].name.as_str(), ("readings"));
+    assert_eq!(catalog[0].id, handle.id());
+    assert_eq!(
+        (
+            catalog[0].elem_size,
+            catalog[0].elem_align,
+            catalog[0].elem_type.as_str()
+        ),
+        (8, 8, "u64")
+    );
 
     let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
-    assert_eq!(region.read_typed::<u64>(0, 3).unwrap(), vec![42, 43, 44]);
+    let elements = region.read_typed_async::<u64>(0, 3).unwrap();
+    let bytes = region.read_async(0, 8).unwrap();
+    assert_eq!(elements.wait().unwrap(), vec![42, 43, 44]);
     // The byte view of the same region: the first element's bytes.
-    assert_eq!(region.read(0, 8).unwrap(), 42u64.to_ne_bytes());
+    assert_eq!(bytes.wait().unwrap(), 42u64.to_ne_bytes());
     // A typed read of a mismatched layout is rejected before the
     // device is touched.
     assert_eq!(
-        region.read_typed::<u32>(0, 2).unwrap_err().kind(),
+        region.read_typed_async::<u32>(0, 2).unwrap_err().kind(),
         std::io::ErrorKind::InvalidInput
     );
 
@@ -55,11 +68,14 @@ fn reader_reads_what_the_owner_shares() {
         .find(|metadata| metadata.id == late.id())
         .unwrap();
     let late_region = reader.get_remote_mr(late_meta, Some(0)).unwrap();
-    assert_eq!(late_region.read_typed::<u32>(0, 2).unwrap(), vec![7, 8]);
+    assert_eq!(
+        late_region.read_typed_async::<u32>(0, 2).unwrap().wait().unwrap(),
+        vec![7, 8]
+    );
 
     // The owner keeps writing; the reader sees it.
     handle.borrow_mut()[1] = 99;
-    assert_eq!(region.read_typed::<u64>(1, 1).unwrap(), vec![99]);
+    assert_eq!(region.read_typed_async::<u64>(1, 1).unwrap().wait().unwrap(), vec![99]);
 }
 
 /// The write path of the same flow: the reader writes into the shared
@@ -80,7 +96,7 @@ fn reader_writes_what_the_owner_shares() {
     owner.serve().unwrap();
 
     // Reader: join group 0 and write into the region, element-wise
-    // over RDMA.
+    // over RDMA, through the engine.
     let reader = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::new(
         "localhost",
         RDMA_PORT,
@@ -90,28 +106,43 @@ fn reader_writes_what_the_owner_shares() {
     let catalog = reader.get_remote_mr_metadata();
     let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
 
-    region.write_typed::<u64>(1, &[7, 8]).unwrap();
+    region.write_typed_async::<u64>(1, vec![7, 8]).unwrap().wait().unwrap();
     // The owner sees the written elements...
     assert_eq!(&*handle.borrow(), &[0, 7, 8, 0]);
     // ...and so does the reader, reading them back.
-    assert_eq!(region.read_typed::<u64>(1, 2).unwrap(), vec![7, 8]);
+    assert_eq!(
+        region.read_typed_async::<u64>(1, 2).unwrap().wait().unwrap(),
+        vec![7, 8]
+    );
 
     // The byte view: a raw write of the first element's bytes.
-    region.write(0, &13u64.to_ne_bytes()).unwrap();
+    region
+        .write_async(0, 13u64.to_ne_bytes().to_vec())
+        .unwrap().wait()
+        .unwrap();
     assert_eq!(&*handle.borrow(), &[13, 7, 8, 0]);
-    assert_eq!(region.read(0, 8).unwrap(), 13u64.to_ne_bytes());
+    assert_eq!(
+        region.read_async(0, 8).unwrap().wait().unwrap(),
+        13u64.to_ne_bytes()
+    );
 
     // Bounds and layout are checked before the device is touched.
     assert_eq!(
-        region.write_typed::<u64>(3, &[0u64; 2]).unwrap_err().kind(),
+        region
+            .write_typed_async::<u64>(3, vec![0u64; 2])
+            .unwrap_err()
+            .kind(),
         std::io::ErrorKind::InvalidInput
     );
     assert_eq!(
-        region.write_typed::<u32>(0, &[0u32; 2]).unwrap_err().kind(),
+        region
+            .write_typed_async::<u32>(0, vec![0u32; 2])
+            .unwrap_err()
+            .kind(),
         std::io::ErrorKind::InvalidInput
     );
     assert_eq!(
-        region.write(31, &[0u8; 8]).unwrap_err().kind(),
+        region.write_async(31, vec![0u8; 8]).unwrap_err().kind(),
         std::io::ErrorKind::InvalidInput
     );
 }

@@ -7,18 +7,31 @@
 //! metadata channel — greeting, joining the group, connecting over
 //! RDMA (which the remote accepts into the group's protection
 //! domain), and receiving the region catalog and the group's tuples.
+//!
+//! One-sided operations are async, through the operations engine
+//! ([`Engine`], see `docs/async_engine.md`): submitting registers the
+//! buffer, posts the operation, and parks the buffer in the engine's
+//! slot — everything on the engine's thread, interleaved polling of
+//! every waiting operation from one optionally CPU-pinned thread. The
+//! returned [`RegionOp`] is an ordinary future: await it, join them,
+//! select them, or [`RegionOp::wait`] it without an executor.
 
 use std::any::type_name;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
+use std::marker::PhantomData;
 use std::mem::{align_of, size_of};
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
 
+use crate::engine::{CompletionSource, Op, OpHandle, OpTarget, Submitted};
 use crate::meta::{Channel, Message, TupleDesc, PROTOCOL_VERSION};
 use crate::pod::zeroed_vec;
 use crate::rdma;
-use crate::RemoteSafe;
+use crate::{Engine, RemoteSafe};
 
 /// Data used to reach a remote machine running a memory provider.
 ///
@@ -50,13 +63,23 @@ impl RemoteMemoryProviderAddr {
 /// [`Self::update`] runs a group's session with the remote — the RDMA
 /// connection of the group is established as part of it, so nothing
 /// connects until the first update, keeping construction infallible.
+/// The provider's operations run through its [`Engine`]: the one
+/// handed to [`Self::with_engine`], or an own unpinned one.
 #[derive(Debug)]
 pub struct RemoteMemoryProvider {
     /// Where to reach the remote machine.
     addr: RemoteMemoryProviderAddr,
+    /// The engine that posts and polls every operation: the one the
+    /// provider was built with, or its own unpinned default.
+    engine: Engine,
+    /// The shared completion queues, one per device the provider's
+    /// connections landed on — every connection of a device posts
+    /// its completions into its device's queue, and the engine drains
+    /// each queue from one poll site (see `docs/async_engine.md`).
+    completions: RefCell<Vec<rdma::SharedCompletions>>,
     /// Sessions by group, established by [`Self::update`]: the
     /// metadata channel, kept open for re-requests, and the group's
-    /// RDMA connection.
+    /// engine-registered RDMA connection.
     pub(crate) sessions: RefCell<HashMap<u32, GroupSession>>,
     /// Catalog of the remote's regions, as advertised by the remote.
     pub(crate) metadata: RefCell<Vec<RemoteMemoryRegionMetadata>>,
@@ -75,29 +98,40 @@ pub(crate) struct GroupSession {
     /// [`RemoteMemoryProvider::update`]; dropped when an exchange
     /// fails, so the next update opens a fresh session.
     pub(crate) channel: Option<Channel>,
-    /// The group's RDMA connection, established by the session's
-    /// rendezvous; the group's regions read through it.
+    /// The group's RDMA connection slot, filled by the session's
+    /// rendezvous; the group's regions operate through it.
     pub(crate) connection: Rc<RefCell<GroupConnection>>,
 }
 
-/// The RDMA connection of one group: established by the group's
-/// session, read by the group's regions.
+/// The RDMA connection of one group: the engine the connection was
+/// registered with, and its id there. Filled by a session's
+/// rendezvous; empty otherwise, and operating through it fails until
+/// a successful [`RemoteMemoryProvider::update`] of the group.
 #[derive(Debug)]
 pub(crate) struct GroupConnection {
-    pub(crate) connection: Option<rdma::Connection>,
+    /// The engine the group's connection is registered with — the
+    /// provider's, whatever it was built with.
+    pub(crate) engine: Engine,
+    /// The connection id the engine assigned; absent with no
+    /// session.
+    pub(crate) conn: Option<u32>,
 }
 
 impl GroupConnection {
-    /// A slot no session has filled yet: reads through it fail — a
-    /// successful [`RemoteMemoryProvider::update`] of the group is
-    /// needed first.
-    pub(crate) fn empty() -> Self {
-        Self { connection: None }
+    /// A slot no session has filled yet: operations through it fail
+    /// — a successful [`RemoteMemoryProvider::update`] of the group
+    /// is needed first.
+    pub(crate) fn empty(engine: Engine) -> Self {
+        Self {
+            engine,
+            conn: None,
+        }
     }
 
-    /// The connection, or an error explaining why there is none.
-    pub(crate) fn get(&self) -> io::Result<&rdma::Connection> {
-        self.connection.as_ref().ok_or_else(|| {
+    /// The group's engine-registered connection id, or an error
+    /// explaining why there is none.
+    pub(crate) fn get(&self) -> io::Result<u32> {
+        self.conn.ok_or_else(|| {
             io::Error::other("the group has no RDMA connection: a successful update is required first")
         })
     }
@@ -146,13 +180,17 @@ pub struct RemoteMemoryRegionMetadata {
 /// An active memory region on the remote machine, as returned by
 /// [`RemoteMemoryProvider::get_remote_mr`].
 ///
-/// Reads and writes go through the RDMA connection of the region's
-/// group — established by that group's
-/// [`RemoteMemoryProvider::update`] — as bytes ([`Self::read`],
-/// [`Self::read_into`], [`Self::write`]) or as elements of any
-/// [`RemoteSafe`] type ([`Self::read_typed`], [`Self::read_into_typed`],
-/// [`Self::write_typed`]), provided that is the type the sharing side
-/// registered the region as.
+/// Operations go through the operations engine of the region's group
+/// — the group's connection was registered with it by that group's
+/// [`RemoteMemoryProvider::update`] — as bytes ([`Self::read_async`],
+/// [`Self::read_into_async`], [`Self::write_async`]) or as elements
+/// of any [`RemoteSafe`] type ([`Self::read_typed_async`],
+/// [`Self::read_into_typed_async`], [`Self::write_typed_async`]),
+/// provided that is the type the sharing side registered the region
+/// as. Each submission is eager — the checks and the buffer handover
+/// happen at the call — and returns a [`RegionOp`] future that
+/// resolves with the operation's outcome: the buffer back, filled
+/// (a read) or as submitted (a write), on success.
 #[derive(Debug, Clone)]
 pub struct RemoteMemoryRegion {
     /// The group's RDMA connection slot, shared with the provider's
@@ -179,42 +217,34 @@ impl RemoteMemoryRegion {
     /// allocating and returning a new buffer with the data.
     ///
     /// The read must stay within the region: `offset + size` may not
-    /// exceed the region's size.
+    /// exceed the region's size. The buffer is owned by the operation
+    /// until it resolves, so a dropped operation never races the
+    /// device.
     ///
-    /// TODO: every read registers and deregisters its buffer; reuse
-    /// registered memory once performance matters.
-    pub fn read(&self, offset: u64, size: usize) -> io::Result<Vec<u8>> {
-        let mut buffer = vec![0u8; size];
-        self.read_into(offset, size, &mut buffer)?;
-        Ok(buffer)
+    pub fn read_async(&self, offset: u64, size: usize) -> io::Result<RegionOp<u8>> {
+        let buffer = vec![0u8; size];
+        self.read_into_async(offset, buffer)
     }
 
-    /// Read `size` bytes starting at `offset` into the start of `buf`,
-    /// overwriting its first `size` bytes without allocating new memory.
+    /// Read the whole of `buffer`'s worth of bytes starting at
+    /// `offset`, overwriting it without allocating new memory; the
+    /// filled buffer resolves with the operation.
     ///
-    /// `size` may not exceed `buf.len()`, and the read must stay within
-    /// the region.
-    pub fn read_into(&self, offset: u64, size: usize, buf: &mut [u8]) -> io::Result<()> {
-        if size > buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("read of {size} bytes exceeds the buffer of {} bytes", buf.len()),
-            ));
-        }
-        if offset.saturating_add(size as u64) > self.size as u64 {
+    /// The read must stay within the region: `offset +
+    /// buffer.len()` may not exceed the region's size.
+    ///
+    pub fn read_into_async(&self, offset: u64, buffer: Vec<u8>) -> io::Result<RegionOp<u8>> {
+        if offset.saturating_add(buffer.len() as u64) > self.size as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "read of {size} bytes at offset {offset} exceeds the region of {} bytes",
+                    "read of {} bytes at offset {offset} exceeds the region of {} bytes",
+                    buffer.len(),
                     self.size
                 ),
             ));
         }
-
-        let slot = self.connection.borrow();
-        let connection = slot.get()?;
-        let mr = connection.register_addr(buf.as_mut_ptr() as u64, size)?;
-        connection.read(&mr, self.remote_addr + offset, self.rkey, size)
+        self.post_op(Op::Read, offset, Submitted::new(buffer))
     }
 
     /// Read `count` elements starting at element `offset` from the
@@ -226,101 +256,115 @@ impl RemoteMemoryRegion {
     /// though type identity across separately compiled applications
     /// still cannot be verified, only the layout. Both `offset` and
     /// `count` are in elements of `T`; the read must stay within the
-    /// region. For byte offsets, use [`Self::read`].
+    /// region. For byte offsets, use [`Self::read_async`].
     ///
-    /// TODO: every read registers and deregisters its buffer; reuse
-    /// registered memory once performance matters.
-    pub fn read_typed<T: RemoteSafe>(&self, offset: u64, count: usize) -> io::Result<Vec<T>> {
-        let mut buffer = zeroed_vec(count);
-        self.read_into_typed(offset, &mut buffer)?;
-        Ok(buffer)
+    pub fn read_typed_async<T: RemoteSafe>(
+        &self,
+        offset: u64,
+        count: usize,
+    ) -> io::Result<RegionOp<T>> {
+        let buffer = zeroed_vec(count);
+        self.read_into_typed_async(offset, buffer)
     }
 
-    /// Read `buf.len()` elements starting at element `offset` into
-    /// `buf`, without allocating new memory.
+    /// Read the whole of `buffer`'s worth of elements starting at
+    /// element `offset`, overwriting it without allocating new
+    /// memory; the filled buffer resolves with the operation.
     ///
     /// The same `T`, bounds, and element-unit rules as
-    /// [`Self::read_typed`]; a partial read is a shorter `buf` slice.
-    pub fn read_into_typed<T: RemoteSafe>(&self, offset: u64, buf: &mut [T]) -> io::Result<()> {
-        self.check_elem::<T>()?;
-        let elem = size_of::<T>() as u64;
-        let byte_offset = offset.saturating_mul(elem);
-        let size = size_of_val(buf);
-        if byte_offset.saturating_add(size as u64) > self.size as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "read of {} elements at element offset {offset} exceeds the region of {} elements of {} bytes",
-                    buf.len(),
-                    self.size / size_of::<T>(),
-                    size_of::<T>()
-                ),
-            ));
-        }
-        if !(self.remote_addr + byte_offset).is_multiple_of(align_of::<T>() as u64) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "read at element offset {offset} is misaligned for elements of alignment {}",
-                    align_of::<T>()
-                ),
-            ));
-        }
-
-        let slot = self.connection.borrow();
-        let connection = slot.get()?;
-        let mr = connection.register_addr(buf.as_mut_ptr() as u64, size)?;
-        connection.read(&mr, self.remote_addr + byte_offset, self.rkey, size)
+    /// [`Self::read_typed_async`].
+    ///
+    pub fn read_into_typed_async<T: RemoteSafe>(
+        &self,
+        offset: u64,
+        buffer: Vec<T>,
+    ) -> io::Result<RegionOp<T>> {
+        let byte_offset = self.check_elem_layout::<T>(offset, buffer.len())?;
+        self.post_op(Op::Read, byte_offset, Submitted::new(buffer))
     }
 
-    /// Write `buf` to the remote region starting at byte `offset`,
-    /// modifying the remote memory in place.
+    /// Write the whole of `buffer` to the remote region starting at
+    /// byte `offset`, modifying the remote memory in place.
     ///
-    /// The write must stay within the region: `offset + buf.len()` may
-    /// not exceed the region's size.
+    /// The write must stay within the region: `offset +
+    /// buffer.len()` may not exceed the region's size. The buffer is
+    /// owned by the operation until it resolves — handed back on
+    /// success — so a dropped operation never races the device.
     ///
-    /// TODO: every write registers and deregisters its buffer; reuse
-    /// registered memory once performance matters.
-    pub fn write(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
-        if offset.saturating_add(buf.len() as u64) > self.size as u64 {
+    pub fn write_async(&self, offset: u64, buffer: Vec<u8>) -> io::Result<RegionOp<u8>> {
+        if offset.saturating_add(buffer.len() as u64) > self.size as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "write of {} bytes at offset {offset} exceeds the region of {} bytes",
-                    buf.len(),
+                    buffer.len(),
                     self.size
                 ),
             ));
         }
-
-        let slot = self.connection.borrow();
-        let connection = slot.get()?;
-        let mr = connection.register_addr(buf.as_ptr() as u64, buf.len())?;
-        connection.write(&mr, self.remote_addr + offset, self.rkey, buf.len())
+        self.post_op(Op::Write, offset, Submitted::new(buffer))
     }
 
-    /// Write `buf` to the remote region starting at element `offset`,
-    /// modifying the remote memory in place.
+    /// Write the whole of `buffer` to the remote region starting at
+    /// element `offset`, modifying the remote memory in place.
     ///
-    /// The same `T` and element-unit rules as [`Self::read_typed`]:
-    /// `T` must be the element type the sharing side registered the
-    /// region as, and `offset` and `buf.len()` are in elements of `T`;
-    /// the write must stay within the region. For byte offsets, use
-    /// [`Self::write`].
+    /// The same `T` and element-unit rules as
+    /// [`Self::read_typed_async`]: `T` must be the element type the
+    /// sharing side registered the region as, and `offset` and
+    /// `buffer.len()` are in elements of `T`; the write must stay
+    /// within the region. For byte offsets, use [`Self::write_async`].
     ///
-    /// TODO: every write registers and deregisters its buffer; reuse
-    /// registered memory once performance matters.
-    pub fn write_typed<T: RemoteSafe>(&self, offset: u64, buf: &[T]) -> io::Result<()> {
+    pub fn write_typed_async<T: RemoteSafe>(
+        &self,
+        offset: u64,
+        buffer: Vec<T>,
+    ) -> io::Result<RegionOp<T>> {
+        let byte_offset = self.check_elem_layout::<T>(offset, buffer.len())?;
+        self.post_op(Op::Write, byte_offset, Submitted::new(buffer))
+    }
+
+    /// Submit an operation of `buffer.len()` bytes at `offset`
+    /// through the group's engine-registered connection.
+    ///
+    /// The bounds and layout checks ran in the callers; what is left
+    /// is the connection check — no session, no operation — and the
+    /// eager engine submission, from this thread.
+    fn post_op<T: RemoteSafe>(
+        &self,
+        op: Op,
+        offset: u64,
+        submitted: Submitted,
+    ) -> io::Result<RegionOp<T>> {
+        let slot = self.connection.borrow();
+        let handle = slot.engine.submit(
+            slot.get()?,
+            op,
+            OpTarget {
+                remote_addr: self.remote_addr + offset,
+                rkey: self.rkey,
+            },
+            submitted,
+        )?;
+        Ok(RegionOp {
+            handle,
+            _view: PhantomData,
+        })
+    }
+
+    /// Reject a `T` whose layout is not the layout the region is
+    /// shared as, and translate element `offset` + `count` into the
+    /// checked byte offset they name.
+    fn check_elem_layout<T: RemoteSafe>(&self, offset: u64, count: usize) -> io::Result<u64> {
         self.check_elem::<T>()?;
         let elem = size_of::<T>() as u64;
         let byte_offset = offset.saturating_mul(elem);
-        let size = size_of_val(buf);
-        if byte_offset.saturating_add(size as u64) > self.size as u64 {
+        let len = count as u64 * elem;
+        if byte_offset.saturating_add(len) > self.size as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "write of {} elements at element offset {offset} exceeds the region of {} elements of {} bytes",
-                    buf.len(),
+                    "operation of {} elements at element offset {offset} exceeds the region of {} elements of {} bytes",
+                    count,
                     self.size / size_of::<T>(),
                     size_of::<T>()
                 ),
@@ -330,16 +374,12 @@ impl RemoteMemoryRegion {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "write at element offset {offset} is misaligned for elements of alignment {}",
+                    "operation at element offset {offset} is misaligned for elements of alignment {}",
                     align_of::<T>()
                 ),
             ));
         }
-
-        let slot = self.connection.borrow();
-        let connection = slot.get()?;
-        let mr = connection.register_addr(buf.as_ptr() as u64, size)?;
-        connection.write(&mr, self.remote_addr + byte_offset, self.rkey, size)
+        Ok(byte_offset)
     }
 
     /// Reject a `T` whose layout is not the layout the region is
@@ -358,20 +398,100 @@ impl RemoteMemoryRegion {
                 type_name::<T>(),
                 size_of::<T>(),
                 align_of::<T>()
-            ),
+            )
         ))
     }
 }
 
+/// The future of one submitted region operation: it resolves with the
+/// operation's outcome — the buffer back on success (filled, for a
+/// read; as submitted, for a write), the completion's (or the
+/// submission's) error otherwise.
+///
+/// An ordinary `std` future, so any executor works: await it, join
+/// several, select among them, attach callbacks by spawning — or,
+/// without an executor, block on [`Self::wait`]. It is `Send`, so it
+/// can be awaited from any thread; only the submission it came from
+/// was bound to the submitting thread.
+///
+/// Dropping it before resolution abandons the operation, safely: the
+/// engine completes it anyway and frees the buffer.
+#[derive(Debug)]
+pub struct RegionOp<T = u8> {
+    /// The engine-level operation future.
+    handle: OpHandle,
+    /// The element type the buffer comes back as; never owned
+    /// (`fn() -> T` keeps it covariant in `T`).
+    _view: PhantomData<fn() -> T>,
+}
+
+impl<T: RemoteSafe> Future for RegionOp<T> {
+    type Output = io::Result<Vec<T>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // RegionOp is Unpin (its handle is), so the pin never holds.
+        let this = self.get_mut();
+        match Future::poll(Pin::new(&mut this.handle), cx) {
+            Poll::Ready(Ok(buffer)) => match buffer.downcast::<Vec<T>>() {
+                Ok(buffer) => Poll::Ready(Ok(*buffer)),
+                // Unreachable by construction: the buffer was erased
+                // from a `Vec<T>` at submission.
+                Err(_) => Poll::Ready(Err(io::Error::other(
+                    "the engine returned a buffer of the wrong element type — an engine bug",
+                ))),
+            },
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T: RemoteSafe> RegionOp<T> {
+    /// Block until the operation resolves — the join for callers
+    /// without an executor (with one, await instead). The engine
+    /// thread does the waiting work; this thread parks until the
+    /// engine's wake. Operations waited in turn still overlap: they
+    /// complete concurrently, on the engine thread.
+    pub fn wait(self) -> io::Result<Vec<T>> {
+        let buffer = self.handle.wait()?;
+        match buffer.downcast::<Vec<T>>() {
+            Ok(buffer) => Ok(*buffer),
+            // Unreachable by construction — see the future's poll.
+            Err(_) => Err(io::Error::other(
+                "the engine returned a buffer of the wrong element type — an engine bug",
+            )),
+        }
+    }
+}
+
 impl RemoteMemoryProvider {
-    /// Prepare a provider for the remote machine described by `addr`.
+    /// Prepare a provider for the remote machine described by `addr`,
+    /// running its operations on an own, unpinned engine.
     ///
     /// Nothing connects here: the first [`Self::update`] runs a
     /// session — the metadata exchange and the group's RDMA
-    /// connection.
+    /// connection. To share one engine (and its CPU) among several
+    /// providers, or to pin the engine to a CPU, build with
+    /// [`Self::with_engine`] instead.
     pub fn new(addr: RemoteMemoryProviderAddr) -> Self {
+        Self::with_engine(addr, Engine::new())
+    }
+
+    /// Prepare a provider for the remote machine described by `addr`,
+    /// running its operations on `engine`.
+    ///
+    /// Nothing connects here: the first [`Self::update`] runs a
+    /// session — the metadata exchange and the group's RDMA
+    /// connection — and registers that connection with the engine, so
+    /// every operation of every region of this provider posts and
+    /// polls on the engine's thread: share one engine among several
+    /// providers to share one polling thread (and, when the engine is
+    /// [`Engine::on_cpu`]-pinned, one CPU).
+    pub fn with_engine(addr: RemoteMemoryProviderAddr, engine: Engine) -> Self {
         Self {
             addr,
+            engine,
+            completions: RefCell::new(Vec::new()),
             sessions: RefCell::new(HashMap::new()),
             metadata: RefCell::new(Vec::new()),
             regions: RefCell::new(HashMap::new()),
@@ -392,15 +512,19 @@ impl RemoteMemoryProvider {
     /// the group's protection domain — then receives the region
     /// catalog and the group's tuples, which fill
     /// [`Self::get_remote_mr_metadata`] and the regions
-    /// [`Self::get_remote_mr`] hands out. A repeated call re-requests
-    /// both over the open channel, picking up regions the remote
-    /// registered since; if that exchange fails, the channel is
-    /// dropped and the next call runs a fresh session.
+    /// [`Self::get_remote_mr`] hands out. The connection is registered
+    /// with the engine (a previous one, from an earlier session of the
+    /// group, is torn down there), so the group's operations run
+    /// through the engine's thread from here on. A repeated call
+    /// re-requests the catalog and the tuples over the open channel,
+    /// picking up regions the remote registered since; if that
+    /// exchange fails, the channel is dropped and the next call runs
+    /// a fresh session.
     pub fn update(&self, group: u32) -> io::Result<()> {
         let mut sessions = self.sessions.borrow_mut();
         let session = sessions.entry(group).or_insert_with(|| GroupSession {
             channel: None,
-            connection: Rc::new(RefCell::new(GroupConnection::empty())),
+            connection: Rc::new(RefCell::new(GroupConnection::empty(self.engine.clone()))),
         });
 
         if let Some(channel) = session.channel.as_mut() {
@@ -436,10 +560,35 @@ impl RemoteMemoryProvider {
 
             // The rendezvous: the remote, having read the group join,
             // is accepting into the group's protection domain — this
-            // connection, which the group's regions read through.
-            let connection =
-                rdma::Connection::connect((self.addr.address.as_str(), self.addr.rdma_port))?;
-            session.connection.borrow_mut().connection = Some(connection);
+            // connection, whose operations the engine drives. The
+            // connection posts its completions into a shared
+            // completion queue, one per device: the first connection
+            // on a device creates it and registers it with the engine
+            // (every later connection of the device reuses it — one
+            // poll site for them all); a previous session's
+            // connection of the group is torn down on the engine
+            // thread, its outstanding operations flushing to their
+            // handles.
+            let (connection, new_completions) = rdma::Connection::connect_shared(
+                (self.addr.address.as_str(), self.addr.rdma_port),
+                &self.completions.borrow(),
+            )?;
+            let engine_completions = match new_completions {
+                Some(shared) => {
+                    self.completions.borrow_mut().push(shared.clone());
+                    Some(Box::new(shared) as Box<dyn CompletionSource>)
+                }
+                None => None,
+            };
+            let conn = self
+                .engine
+                .register(Box::new(connection), engine_completions)?;
+            {
+                let mut slot = session.connection.borrow_mut();
+                if let Some(old) = slot.conn.replace(conn) {
+                    self.engine.destroy(old)?;
+                }
+            }
 
             let exchange = receive_exchange(&mut channel)?;
             session.channel = Some(channel);
@@ -464,14 +613,17 @@ impl RemoteMemoryProvider {
             .iter()
             .find(|region| group.is_none_or(|g| region.group == g))?;
         // The group's connection slot: the session's when one exists,
-        // a fresh empty one otherwise (reads through it fail: an
-        // update of the group is needed first).
+        // a fresh empty one otherwise (operations through it fail: an
+        // update of the group is needed first) — on the provider's
+        // engine either way.
         let connection = self
             .sessions
             .borrow()
             .get(&cached.group)
             .map(|session| Rc::clone(&session.connection))
-            .unwrap_or_else(|| Rc::new(RefCell::new(GroupConnection::empty())));
+            .unwrap_or_else(|| {
+                Rc::new(RefCell::new(GroupConnection::empty(self.engine.clone())))
+            });
         Some(RemoteMemoryRegion {
             connection,
             remote_addr: cached.remote_addr,

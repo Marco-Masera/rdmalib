@@ -11,14 +11,20 @@
 //! two sides travels over TCP — [`RemoteMemoryProvider::update`] runs a
 //! group's session on the reader side, and the provider serves it
 //! from a background thread ([`SharedMemoryRegionProvider::serve`]).
+//! One-sided operations run through the operations engine
+//! ([`Engine`]): one library-owned, optionally CPU-pinned thread that
+//! posts and polls them all — see `docs/async_engine.md`.
 
 pub mod rdma;
 
+mod engine;
 mod meta;
+mod os;
 mod pod;
 mod providers;
 mod readers;
 
+pub use engine::Engine;
 pub use pod::RemoteSafe;
 pub use providers::{
     SharedMemoryRegionHandle, SharedMemoryRegionMetadata, SharedMemoryRegionProvider,

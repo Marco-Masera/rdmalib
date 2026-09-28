@@ -20,6 +20,9 @@
 ///
 /// - `T` is `Copy` (a supertrait): no destructor ever runs on values
 ///   the remote side fabricated.
+/// - `T` is `Send` (a supertrait): op buffers travel through the
+///   operations engine's threads; the contract's integers and
+///   floats all qualify.
 /// - Every bit pattern is a valid `T`: `#[repr(C)]` structs of
 ///   integers, floats, and other `RemoteSafe` types qualify. `bool`,
 ///   `char`, enums (arbitrary discriminants), references, `Box`,
@@ -34,7 +37,7 @@
 ///   separately and must lay the data out identically. The library
 ///   cannot verify that the sharing and the reading side chose the
 ///   same `T` — a mismatch reads garbage without failing, by design.
-pub unsafe trait RemoteSafe: Copy + 'static {}
+pub unsafe trait RemoteSafe: Copy + Send + 'static {}
 
 /// Implement [`RemoteSafe`](crate::RemoteSafe) for the listed types.
 ///

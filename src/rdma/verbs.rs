@@ -11,13 +11,14 @@
 //! between threads, while exclusive ownership keeps a single object
 //! used by one thread at a time.
 
-use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::os::fd::RawFd;
+use std::sync::{Arc, Mutex};
+
+use crate::engine::{Completion, CompletionSource, InFlight, Op, OpSource, OpTarget, SWEEP_BATCH};
 
 /// RDMA port space used by the connections: TCP-style, reliable.
 const RDMA_PS_TCP: c_int = 0x0106;
@@ -25,12 +26,28 @@ const RDMA_PS_TCP: c_int = 0x0106;
 /// Timeout of the address and route resolution, in milliseconds.
 const RESOLVE_TIMEOUT_MS: c_int = 2000;
 
-/// How long [`Connection::read`] waits for the read completion.
-const POLL_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Depth of the per-connection completion queue; the queue pair is
+/// Depth of a connection's own completion queue; the queue pair is
 /// created with as many send work requests.
 const CQ_SIZE: c_int = 16;
+
+/// Depth of a shared completion queue — one per (engine, device),
+/// fed by every connection on the device, so sized for all of them
+/// at once (the sweep drains it in batches, long before it fills).
+const SHARED_CQ_SIZE: c_int = 256;
+
+/// Byte size of one pooled operation slice: operations at most this
+/// large run through the connection's pooled registration — copied
+/// in at post for a write, copied out at finish for a read — instead
+/// of a registration per operation. Larger operations register
+/// directly (the copy would cost more than the registration it
+/// saves).
+const POOL_ENTRY: usize = 128 * 1024;
+
+/// Pooled slices per connection: the ceiling on operations that run
+/// through the pooled registration at once. An operation that finds
+/// every slice lent out registers directly (the pool never blocks
+/// the engine thread).
+const POOL_SLOTS: usize = 32;
 
 /// Connection requests the listener keeps pending.
 const LISTEN_BACKLOG: c_int = 16;
@@ -78,12 +95,24 @@ struct IbvCq {
     context: *mut IbvContext,
 }
 
-/// `ibv_post_send` and `ibv_poll_cq` are static inline calls in
-/// `infiniband/verbs.h`, not library symbols: they dispatch through
-/// the command table of the device handle.
+/// A completion event channel (`struct ibv_comp_channel`); the `fd` is
+/// what the engine blocks on — readable when the channel fires a
+/// completion event.
+#[repr(C)]
+#[allow(dead_code)]
+struct IbvCompChannel {
+    context: *mut IbvContext,
+    fd: c_int,
+    refcnt: c_int,
+}
+
+/// `ibv_post_send`, `ibv_poll_cq`, and `ibv_req_notify_cq` are static
+/// inline calls in `infiniband/verbs.h`, not library symbols: they
+/// dispatch through the command table of the device handle.
 type PostSendFn =
     unsafe extern "C" fn(*mut IbvQp, *mut IbvSendWr, *mut *mut IbvSendWr) -> c_int;
 type PollCqFn = unsafe extern "C" fn(*mut IbvCq, c_int, *mut IbvWc) -> c_int;
+type ReqNotifyCqFn = unsafe extern "C" fn(*mut IbvCq, c_int) -> c_int;
 
 /// The command-dispatch table of a device (`struct
 /// ibv_context_ops`, leading fields only); the unused entries are
@@ -103,7 +132,7 @@ struct IbvContextOps {
     dealloc_mw: *mut c_void,
     _compat_create_cq: *mut c_void,
     poll_cq: PollCqFn,
-    req_notify_cq: *mut c_void,
+    req_notify_cq: ReqNotifyCqFn,
     _compat_cq_event: *mut c_void,
     _compat_resize_cq: *mut c_void,
     _compat_destroy_cq: *mut c_void,
@@ -312,10 +341,18 @@ unsafe extern "C" {
         context: *mut IbvContext,
         cqe: c_int,
         cq_context: *mut c_void,
-        channel: *mut c_void,
+        channel: *mut IbvCompChannel,
         comp_vector: c_int,
     ) -> *mut IbvCq;
     fn ibv_destroy_cq(cq: *mut IbvCq) -> c_int;
+    fn ibv_create_comp_channel(context: *mut IbvContext) -> *mut IbvCompChannel;
+    fn ibv_destroy_comp_channel(channel: *mut IbvCompChannel) -> c_int;
+    fn ibv_get_cq_event(
+        channel: *mut IbvCompChannel,
+        cq: *mut *mut IbvCq,
+        cq_context: *mut *mut c_void,
+    ) -> c_int;
+    fn ibv_ack_cq_events(cq: *mut IbvCq, nevents: c_uint);
     fn ibv_reg_mr(pd: *mut IbvPd, addr: *mut c_void, length: usize, access: c_int) -> *mut IbvMr;
     fn ibv_dereg_mr(mr: *mut IbvMr) -> c_int;
     fn ibv_wc_status_str(status: c_int) -> *const c_char;
@@ -652,25 +689,39 @@ pub struct Connection {
     /// The protection domain, shared with the connection's group;
     /// absent until the resources are created.
     pd: Option<ProtectionDomain>,
+    /// The completion event channel of the connection's completion
+    /// queue, for the engine's hybrid idle: its `fd` is what the
+    /// engine blocks on between busy windows. Absent until the
+    /// resources are created — and absent with a shared completion
+    /// queue, which owns its own.
+    comp_channel: *mut IbvCompChannel,
     /// Event channel owned by this connection; accepted connections
     /// share the listener's channel and leave this null.
     event_channel: *mut RdmaEventChannel,
-    /// Work request ids, to match completions in [`Connection::read`].
-    next_wr_id: Cell<u64>,
+    /// The shared completion queue this connection posts into, when it
+    /// was created for one ([`Self::connect_shared`]). Holds the queue
+    /// alive until this queue pair is destroyed; without one, the
+    /// connection owns its queue and channel itself.
+    shared: Option<SharedCompletions>,
+    /// The connection's pooled registration, created lazily at the
+    /// first pooled operation (see [`Pool`]); absent until then.
+    pool: Option<Pool>,
 }
 
-// SAFETY: the wrapped connection has no thread affinity (its `Cell`
-// is `Send`, its domain handle now is too), so moving it to another
-// thread is sound; access stays serialized by ownership, and `Sync`
-// is deliberately not implemented — concurrent reads of one
-// connection are not part of the contract.
+// SAFETY: the wrapped connection has no thread affinity (its domain
+// handle is `Send`), so moving it to another thread is sound; access
+// stays serialized by ownership, and `Sync` is deliberately not
+// implemented — concurrent use of one connection is the engine's
+// business, through the `OpSource` seam, not the caller's.
 unsafe impl Send for Connection {}
 
 impl Connection {
     /// Connect to the remote machine listening at `addr`.
     ///
     /// Resolves the address and route, creates the connection
-    /// resources, and establishes the connection.
+    /// resources — the connection's own completion queue — and
+    /// establishes the connection. For the engine's shared queue, use
+    /// [`Self::connect_shared`].
     pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let mut dst = SockaddrIn::from(resolve_v4(addr)?);
         let event_channel =
@@ -679,16 +730,54 @@ impl Connection {
             id: std::ptr::null_mut(),
             cq: std::ptr::null_mut(),
             pd: None,
+            comp_channel: std::ptr::null_mut(),
             event_channel,
-            next_wr_id: Cell::new(0),
+            shared: None,
+            pool: None,
         };
-        conn.connect_to(&mut dst)?;
+        conn.connect_to(&mut dst, &[])?;
         Ok(conn)
     }
 
+    /// Connect to the remote machine listening at `addr`, posting the
+    /// connection's completions into a shared completion queue.
+    ///
+    /// The queue: the first of `shared` that lives on the
+    /// connection's device; none does (or none was given), a fresh one
+    /// for that device, returned so the caller can register it with
+    /// the engine and keep it for the device's later connections.
+    /// Every connection of one engine on one device shares one queue
+    /// that way, so the engine's one poll drains them all,
+    /// interleaved in arrival order (see `docs/async_engine.md`).
+    pub fn connect_shared<A: ToSocketAddrs>(
+        addr: A,
+        shared: &[SharedCompletions],
+    ) -> io::Result<(Self, Option<SharedCompletions>)> {
+        let mut dst = SockaddrIn::from(resolve_v4(addr)?);
+        let event_channel =
+            check_ptr("rdma_create_event_channel", unsafe { rdma_create_event_channel() })?;
+        let mut conn = Self {
+            id: std::ptr::null_mut(),
+            cq: std::ptr::null_mut(),
+            pd: None,
+            comp_channel: std::ptr::null_mut(),
+            event_channel,
+            shared: None,
+            pool: None,
+        };
+        let new_shared = conn.connect_to(&mut dst, shared)?;
+        Ok((conn, new_shared))
+    }
+
     /// Establish the connection; on failure the partially built `conn`
-    /// is dropped by the caller, releasing the resources created so far.
-    fn connect_to(&mut self, dst: &mut SockaddrIn) -> io::Result<()> {
+    /// is dropped by the caller, releasing the resources created so
+    /// far. Completes into the first of `shared` on this connection's
+    /// device, or a fresh one it creates (and returns) for it.
+    fn connect_to(
+        &mut self,
+        dst: &mut SockaddrIn,
+        shared: &[SharedCompletions],
+    ) -> io::Result<Option<SharedCompletions>> {
         check(
             "rdma_create_id",
             unsafe {
@@ -720,21 +809,53 @@ impl Connection {
         )?;
         let context = unsafe { (*self.id).verbs };
         let pd = ProtectionDomain::alloc(context)?;
-        self.create_resources(pd)?;
+        // The device is known only now, after the route resolved: pick
+        // the shared queue living on it, or create one for it.
+        let (shared, new) = match shared.iter().find(|sc| sc.context() == context) {
+            Some(sc) => (Some(sc.clone()), None),
+            None => {
+                let sc = SharedCompletions::on_device(context)?;
+                (Some(sc.clone()), Some(sc))
+            }
+        };
+        self.create_resources(pd, shared.as_ref())?;
         let mut param = conn_param();
         check("rdma_connect", unsafe { rdma_connect(self.id, &mut param) })?;
-        wait_event(self.event_channel, RDMA_CM_EVENT_ESTABLISHED, "rdma_connect")
+        wait_event(self.event_channel, RDMA_CM_EVENT_ESTABLISHED, "rdma_connect")?;
+        Ok(new)
     }
 
     /// Create the completion queue and the queue pair on this
     /// connection's device, in `pd`.
-    fn create_resources(&mut self, pd: ProtectionDomain) -> io::Result<()> {
-        let context = unsafe { (*self.id).verbs };
-        let cq = check_ptr(
-            "ibv_create_cq",
-            unsafe { ibv_create_cq(context, CQ_SIZE, std::ptr::null_mut(), std::ptr::null_mut(), 0) },
-        )?;
-        self.cq = cq;
+    ///
+    /// With a `shared` queue, the queue pair posts its completions
+    /// into it (kept alive by the connection) and the connection owns
+    /// no queue of its own; without one, it creates its own queue and
+    /// its completion event channel — the `fd` a poller could block
+    /// on between busy windows.
+    fn create_resources(
+        &mut self,
+        pd: ProtectionDomain,
+        shared: Option<&SharedCompletions>,
+    ) -> io::Result<()> {
+        let cq = match shared {
+            Some(sc) => sc.raw_cq(),
+            None => {
+                let context = unsafe { (*self.id).verbs };
+                let comp_channel = check_ptr(
+                    "ibv_create_comp_channel",
+                    unsafe { ibv_create_comp_channel(context) },
+                )?;
+                let cq = check_ptr(
+                    "ibv_create_cq",
+                    unsafe { ibv_create_cq(context, CQ_SIZE, std::ptr::null_mut(), comp_channel, 0) },
+                )?;
+                self.comp_channel = comp_channel;
+                self.cq = cq;
+                self.shared = None;
+                cq
+            }
+        };
 
         // A reliable connection signaling every send, like the C
         // library: each read completion is then always reported.
@@ -758,6 +879,7 @@ impl Connection {
             unsafe { rdma_create_qp(self.id, pd.raw(), &mut attr) },
         )?;
         self.pd = Some(pd);
+        self.shared = shared.cloned();
         Ok(())
     }
 
@@ -768,21 +890,6 @@ impl Connection {
         self.pd.clone().expect("the connection is established")
     }
 
-    /// Register `buffer` for RDMA access in this connection's
-    /// protection domain.
-    ///
-    /// Returns the registered [`MemoryRegion`]: its [`MemoryRegion::tuple`]
-    /// is what remote readers need to access the buffer remotely; its
-    /// [`MemoryRegion::lkey`] is what local operations require. The
-    /// buffer may be modified remotely at any time while registered,
-    /// through every connection of the domain.
-    ///
-    /// The buffer must outlive the returned region without moving or
-    /// being resized: drop the region first.
-    pub fn register(&self, buffer: &[u8]) -> io::Result<MemoryRegion> {
-        self.protection_domain().register(buffer)
-    }
-
     /// Register the memory at `addr`..`addr + size` in this
     /// connection's protection domain.
     ///
@@ -790,58 +897,47 @@ impl Connection {
     /// address and size are tracked separately from a Rust borrow:
     /// the memory must stay valid and unmoved while the region is
     /// alive, but no Rust reference to it needs to exist while it is
-    /// being registered or read into.
-    pub fn register_addr(&self, addr: u64, size: usize) -> io::Result<MemoryRegion> {
+    /// being registered or read into. This is the engine's op-buffer
+    /// path, through the `OpSource` seam below — one-sided operations
+    /// run through the engine (see `docs/async_engine.md`), so a
+    /// connection offers no read/write calls of its own.
+    fn register_addr(&self, addr: u64, size: usize) -> io::Result<MemoryRegion> {
         self.protection_domain().register_addr(addr, size)
     }
 
-    /// Read `len` bytes at `remote_addr` of the remote machine,
-    /// accessed with `rkey`, into the first `len` bytes of `mr`, a
-    /// region registered in this connection's protection domain.
+    /// Post one one-sided RDMA operation tagged `wr_id`, without
+    /// waiting for its completion.
     ///
-    /// Synchronous: blocks until the read completes or
-    /// [`POLL_TIMEOUT`] elapses. Out-of-bounds reads are detected by
-    /// the remote machine and fail with a remote access error.
-    pub fn read(&self, mr: &MemoryRegion, remote_addr: u64, rkey: u32, len: usize) -> io::Result<()> {
-        self.one_sided("read", IBV_WR_RDMA_READ, mr, remote_addr, rkey, len)
-    }
-
-    /// Write the first `len` bytes of `mr`, a region registered in
-    /// this connection's protection domain, to `remote_addr` of the
-    /// remote machine, accessed with `rkey`.
-    ///
-    /// Synchronous: blocks until the write completes or
-    /// [`POLL_TIMEOUT`] elapses. The remote memory must be registered
-    /// for remote writes — every region the high-level providers
-    /// share is — and out-of-bounds writes are detected by the remote
-    /// machine and fail with a remote access error.
-    pub fn write(&self, mr: &MemoryRegion, remote_addr: u64, rkey: u32, len: usize) -> io::Result<()> {
-        self.one_sided("write", IBV_WR_RDMA_WRITE, mr, remote_addr, rkey, len)
-    }
-
-    /// Post one one-sided RDMA operation and wait for its completion.
-    ///
+    /// The checks of the operation path live here: the zero-length
+    /// and out-of-bounds checks, and the protection-domain check.
     /// `opcode` picks the operation ([`IBV_WR_RDMA_READ`] or
     /// [`IBV_WR_RDMA_WRITE`]); `op` names it in error messages. The
-    /// first `len` bytes of `mr` are the operation's local end — the
-    /// destination of a read, the source of a write — and
+    /// first `len` bytes of `mr` at `offset` are the operation's
+    /// local end — the destination of a read, the source of a write;
+    /// a pooled operation's slice names its offset into the pool's
+    /// registration, a directly registered one a 0 into its own — and
     /// `remote_addr`, accessed with `rkey`, its remote end; `mr` must
-    /// be registered in this connection's protection domain.
-    fn one_sided(
+    /// be registered in this connection's protection domain. The
+    /// completion is polled by the engine, and its `wr_id` is how
+    /// the poller tells the posted operations apart.
+    #[allow(clippy::too_many_arguments)] // the verbs call it mirrors is this wide
+    fn post(
         &self,
         op: &str,
         opcode: c_int,
         mr: &MemoryRegion,
+        offset: usize,
         remote_addr: u64,
         rkey: u32,
         len: usize,
+        wr_id: u64,
     ) -> io::Result<()> {
         if len == 0 {
             return Err(invalid(format!("cannot {op} zero bytes")));
         }
-        if len > mr.size {
+        if offset.saturating_add(len) > mr.size {
             return Err(invalid(format!(
-                "{op} of {len} bytes exceeds the registered region of {} bytes",
+                "{op} of {len} bytes at offset {offset} exceeds the registered region of {} bytes",
                 mr.size
             )));
         }
@@ -852,9 +948,8 @@ impl Connection {
             ));
         }
 
-        let wr_id = self.next_wr_id.replace(self.next_wr_id.get() + 1);
         let mut sge = IbvSge {
-            addr: mr.addr,
+            addr: mr.addr + offset as u64,
             length: len as u32,
             lkey: mr.lkey,
         };
@@ -878,37 +973,9 @@ impl Connection {
         check(
             "ibv_post_send",
             unsafe { post_send(qp, &mut send_wr, &mut bad_wr) },
-        )?;
-
-        // Wait for this operation's completion, skipping stale ones
-        // (e.g. left by an operation that timed out). ibv_poll_cq is a
-        // static inline call in verbs.h, dispatched like ibv_post_send.
-        let poll_cq = unsafe { (*(*self.cq).context).ops.poll_cq };
-        let deadline = Instant::now() + POLL_TIMEOUT;
-        let mut wc: IbvWc = unsafe { std::mem::zeroed() };
-        loop {
-            let ret = unsafe { poll_cq(self.cq, 1, &mut wc) };
-            if ret < 0 {
-                check("ibv_poll_cq", -ret)?;
-            }
-            if ret == 1 && wc.wr_id == wr_id {
-                if wc.status != IBV_WC_SUCCESS {
-                    return Err(io::Error::other(format!(
-                        "RDMA {op} failed: {} (vendor error {})",
-                        status_str(wc.status),
-                        wc.vendor_err
-                    )));
-                }
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("timed out waiting for the RDMA {op} completion"),
-                ));
-            }
-        }
+        )
     }
+
 }
 
 impl Drop for Connection {
@@ -916,7 +983,10 @@ impl Drop for Connection {
         // Best effort: disconnected or never-connected ids return an
         // error, which is ignored here. The shared protection domain
         // (a struct field) drops after this, deallocating the domain
-        // once its last connection and registration are gone.
+        // once its last connection and registration are gone. The
+        // shared completion queue (a struct field too) also drops
+        // after this — after the queue pair above is destroyed, which
+        // is the order the queue requires.
         unsafe {
             if !self.id.is_null() {
                 if !(*self.id).qp.is_null() {
@@ -925,8 +995,15 @@ impl Drop for Connection {
                 }
                 rdma_destroy_id(self.id);
             }
-            if !self.cq.is_null() {
-                ibv_destroy_cq(self.cq);
+            // Only the connection's own queue: a shared one is owned
+            // by the SharedCompletions the field holds.
+            if self.shared.is_none() {
+                if !self.cq.is_null() {
+                    ibv_destroy_cq(self.cq);
+                }
+                if !self.comp_channel.is_null() {
+                    ibv_destroy_comp_channel(self.comp_channel);
+                }
             }
             if !self.event_channel.is_null() {
                 rdma_destroy_event_channel(self.event_channel);
@@ -939,6 +1016,410 @@ impl fmt::Debug for Connection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // The raw identifier is enough to tell connections apart.
         f.debug_struct("Connection").field("id", &self.id).finish()
+    }
+}
+
+/// The verbs half of the operations engine (src/engine.rs): every
+/// registered connection reaches the engine as an [`OpSource`], and
+/// the engine drives it through this seam — posting and closing — so
+/// the engine itself knows no verbs and runs, tested, against
+/// injected fakes instead of hardware. Completions arrive through the
+/// [`SharedCompletions`] the connection posts into, as a
+/// [`CompletionSource`].
+impl OpSource for Connection {
+    fn submit(
+        &mut self,
+        op: Op,
+        addr: u64,
+        len: usize,
+        target: OpTarget,
+        wr_id: u64,
+    ) -> io::Result<Box<dyn InFlight>> {
+        let opcode = match op {
+            Op::Read => IBV_WR_RDMA_READ,
+            Op::Write => IBV_WR_RDMA_WRITE,
+        };
+        // The pooled path first: an operation at most [`POOL_ENTRY`]
+        // bytes runs through a slice of the connection's pooled
+        // registration — a copy at post for a write, a copy at finish
+        // for a read — reusing the one registration for every such
+        // operation instead of registering each one's buffer.
+        if let Some(pooled) = self.pooled(op, addr, len)? {
+            self.post(
+                op.name(),
+                opcode,
+                &pooled.pool.mr,
+                pooled.offset,
+                target.remote_addr,
+                target.rkey,
+                len,
+                wr_id,
+            )?;
+            return Ok(pooled.flight);
+        }
+        // The direct path: register the operation's local memory in
+        // this connection's domain, post the operation, and hand the
+        // registration back as the in-flight hold: the engine keeps
+        // it until the completion is processed — its drop
+        // deregisters, so the memory is released only after the
+        // device is done with it.
+        let mr = self.register_addr(addr, len)?;
+        self.post(
+            op.name(),
+            opcode,
+            &mr,
+            0,
+            target.remote_addr,
+            target.rkey,
+            len,
+            wr_id,
+        )?;
+        Ok(Box::new(mr))
+    }
+
+    fn close(&mut self) {
+        // Best effort: the queue pair moves to the error state and
+        // its outstanding operations flush as error completions, which
+        // the engine resolves; an error (an id never fully connected)
+        // is ignored — the drop that follows tears it down anyway.
+        unsafe { rdma_disconnect(self.id) };
+    }
+}
+
+impl Connection {
+    /// The pooled path of a submitted operation, when one fits: a
+    /// slice of the connection's pooled registration lent out for it,
+    /// with its offset into the registration (the post reads the
+    /// local end from there) and the in-flight hold that returns it.
+    /// A write's bytes are copied into the slice here; a read's come
+    /// back at the hold's finish. Returns `None` — the operation
+    /// registers directly — when it is larger than [`POOL_ENTRY`] or
+    /// the pool is fully lent out (the pool never blocks the engine
+    /// thread).
+    fn pooled(&mut self, op: Op, addr: u64, len: usize) -> io::Result<Option<Pooled>> {
+        if len == 0 || len > POOL_ENTRY {
+            return Ok(None);
+        }
+        let pool = match self.pool.as_ref() {
+            Some(pool) => Arc::clone(&pool.inner),
+            None => {
+                // The first pooled operation creates the pool: one
+                // allocation, registered once, reused for every
+                // pooled operation of this connection from now on.
+                let pool = Pool::new(&self.protection_domain())?;
+                let inner = Arc::clone(&pool.inner);
+                self.pool = Some(pool);
+                inner
+            }
+        };
+        let Some(entry) = pool.free.lock().unwrap().pop() else {
+            return Ok(None); // fully lent out: register directly
+        };
+        let offset = entry as usize * POOL_ENTRY;
+        if matches!(op, Op::Write) {
+            // The device reads the bytes from the pool, so they must
+            // be here before the post. Safe: the operation's buffer
+            // is parked in the engine's slot, owned and untouched
+            // from submission to resolution, and its heap never
+            // moves — the same lifetime guarantee the direct
+            // registration relies on.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    addr as *const u8,
+                    (pool.mr.addr as *mut u8).add(offset),
+                    len,
+                );
+            }
+        }
+        let flight = PooledFlight {
+            pool: Arc::clone(&pool),
+            entry: Some(entry),
+            addr,
+            len,
+            read: matches!(op, Op::Read),
+        };
+        Ok(Some(Pooled {
+            pool,
+            offset,
+            flight: Box::new(flight),
+        }))
+    }
+}
+
+/// What a pooled submission runs with: the pool (its registration is
+/// the post's local end), the lent slice's byte offset into it, and
+/// the in-flight hold that returns the slice.
+struct Pooled {
+    pool: Arc<PoolInner>,
+    offset: usize,
+    flight: Box<dyn InFlight>,
+}
+
+/// The pooled registration of one connection: one contiguous
+/// allocation, registered once, its [`POOL_ENTRY`]-byte slices lent
+/// to operations one at a time — a registration per operation
+/// replaced by a copy in (a write) and a copy out (a read), at a
+/// fraction of the cost.
+struct Pool {
+    inner: Arc<PoolInner>,
+}
+
+struct PoolInner {
+    /// The registration of the whole pool. First field: it must
+    /// deregister, here on the engine thread, before the allocation
+    /// it pins (`memory`, below) drops.
+    mr: MemoryRegion,
+    /// The pooled allocation, pinned by `mr` — never resized or
+    /// moved while the registration lives. Read at creation only: it
+    /// exists to own — and, when the last holder drops, free — the
+    /// memory the registration pins, not to be read through.
+    #[allow(dead_code)] // owning is its whole job
+    memory: Vec<u8>,
+    /// The free slices, as their indices — lent from the end, so the
+    /// first operations share cache lines early in the pool.
+    free: Mutex<Vec<u32>>,
+}
+
+// SAFETY: nothing here runs verbs calls through shared references —
+// a shared `PoolInner` reads its registration's captured fields
+// (addr, lkey) and the free list, both plain data behind the
+// `Mutex` or never written after creation — and the one verbs call
+// on the registration (its deregister) happens exactly once, in
+// `Drop`, under the `Arc`'s exclusive final reference. This is what
+// lets in-flight holds of a connection's pool live on the engine
+// thread while the connection itself stays on it too.
+unsafe impl Send for PoolInner {}
+unsafe impl Sync for PoolInner {}
+
+impl Pool {
+    fn new(pd: &ProtectionDomain) -> io::Result<Self> {
+        let memory = vec![0u8; POOL_SLOTS * POOL_ENTRY];
+        let mr = pd.register_addr(memory.as_ptr() as u64, memory.len())?;
+        // The registration and the allocation agree — the registration's
+        // captured address is what every lent slice is offset from.
+        debug_assert_eq!(mr.addr, memory.as_ptr() as u64);
+        let free = Mutex::new((0..POOL_SLOTS as u32).rev().collect());
+        Ok(Self {
+            inner: Arc::new(PoolInner { mr, memory, free }),
+        })
+    }
+}
+
+/// The in-flight hold of a pooled operation: the lent slice, copied
+/// back and returned at finish, plus the operation's own buffer
+/// address, copied into at finish on a successful read.
+struct PooledFlight {
+    pool: Arc<PoolInner>,
+    entry: Option<u32>,
+    addr: u64,
+    len: usize,
+    read: bool,
+}
+
+impl InFlight for PooledFlight {
+    fn finish(&mut self, ok: bool) {
+        let Some(entry) = self.entry else {
+            return; // already finished (a duplicate completion)
+        };
+        if self.read && ok {
+            // The device wrote into the pool; the operation's buffer
+            // — the engine slot's `Vec`'s heap, valid and untouched
+            // until it resolves right after this — takes the bytes
+            // here, before its handle sees them.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (self.pool.mr.addr as *const u8).add(entry as usize * POOL_ENTRY),
+                    self.addr as *mut u8,
+                    self.len,
+                );
+            }
+        }
+        self.entry = None;
+        self.pool.free.lock().unwrap().push(entry);
+    }
+}
+
+impl Drop for PooledFlight {
+    fn drop(&mut self) {
+        // Defensive only: every resolved path finishes first, and a
+        // finish already returned the slice. A drop without one (an
+        // engine bug, or a slot vanished between post and completion)
+        // still returns the slice — without the copy, the outcome is
+        // gone — so a leak degrades the pool, never the safety.
+        if let Some(entry) = self.entry.take() {
+            self.pool.free.lock().unwrap().push(entry);
+        }
+    }
+}
+
+/// The in-flight hold of a directly registered operation: the
+/// registration itself. Finishing has nothing to do; the drop
+/// deregisters, which is exactly the release.
+impl InFlight for MemoryRegion {
+    fn finish(&mut self, _ok: bool) {}
+}
+
+/// A shared completion queue with its completion event channel, on one
+/// device: the completion half of one engine — every connection
+/// created for it ([`Connection::connect_shared`]) posts its
+/// completions into the queue, so one poll drains them all,
+/// interleaved in arrival order. One per (engine, device): a
+/// connection landing on another device gets a queue of its own.
+///
+/// Cloning a handle shares the queue; it is destroyed once the last
+/// handle, connection, and engine registration are gone — after
+/// every queue pair posting into it. Safety contract: no queue pair
+/// of a connection may outlive the last handle.
+#[derive(Clone)]
+pub struct SharedCompletions {
+    inner: Arc<ScInner>,
+}
+
+struct ScInner {
+    /// The device the queue lives on — the connection-creation match.
+    context: *mut IbvContext,
+    cq: *mut IbvCq,
+    channel: *mut IbvCompChannel,
+}
+
+// SAFETY: the wrapped queue has no thread affinity, and the verbs API
+// permits a CQ to be referenced (queue pairs created on it) from
+// several threads; polling stays on the engine thread, destruction
+// exclusive by the `Arc` refcount. This is what lets clones of the
+// handle live on different threads — and why the handle must stay on
+// `Arc`, whose atomic refcount that relies on.
+unsafe impl Send for ScInner {}
+unsafe impl Sync for ScInner {}
+
+impl SharedCompletions {
+    /// A shared queue of `SHARED_CQ_SIZE` entries on `context`'s
+    /// device.
+    fn on_device(context: *mut IbvContext) -> io::Result<Self> {
+        let channel = check_ptr("ibv_create_comp_channel", unsafe {
+            ibv_create_comp_channel(context)
+        })?;
+        let cq = check_ptr(
+            "ibv_create_cq",
+            unsafe { ibv_create_cq(context, SHARED_CQ_SIZE, std::ptr::null_mut(), channel, 0) },
+        )?;
+        Ok(Self {
+            inner: Arc::new(ScInner {
+                context,
+                cq,
+                channel,
+            }),
+        })
+    }
+
+    /// The device the queue lives on.
+    fn context(&self) -> *mut IbvContext {
+        self.inner.context
+    }
+
+    /// The raw queue, for the queue pair of a connection created for
+    /// this shared queue.
+    fn raw_cq(&self) -> *mut IbvCq {
+        self.inner.cq
+    }
+}
+
+impl Drop for ScInner {
+    fn drop(&mut self) {
+        // The queue before its channel; a queue with unacknowledged
+        // events would wait for them (the engine acknowledges
+        // one-to-one).
+        unsafe {
+            ibv_destroy_cq(self.cq);
+            ibv_destroy_comp_channel(self.channel);
+        }
+    }
+}
+
+impl fmt::Debug for SharedCompletions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The raw queue is enough to tell shared queues apart.
+        f.debug_struct("SharedCompletions")
+            .field("cq", &self.inner.cq)
+            .finish()
+    }
+}
+
+/// The completion half of the operations engine: the shared queue
+/// polls — every connection on its device, interleaved — and its
+/// event channel is what the engine blocks on between busy windows.
+impl CompletionSource for SharedCompletions {
+    fn poll(&mut self, out: &mut [Completion]) -> io::Result<usize> {
+        // A fixed batch of raw completions, at most the engine's sweep
+        // batch (SWEEP_BATCH) per poll, from every connection posting
+        // into the shared queue.
+        let mut wc: [IbvWc; SWEEP_BATCH] = unsafe { std::mem::zeroed() };
+        let want = out.len().min(SWEEP_BATCH);
+        // ibv_poll_cq is a static inline call in verbs.h, dispatched
+        // through the device's command table; a negative return is the
+        // errno.
+        let poll_cq = unsafe { (*(*self.inner.cq).context).ops.poll_cq };
+        let ret = unsafe { poll_cq(self.inner.cq, want as c_int, wc.as_mut_ptr()) };
+        if ret < 0 {
+            return Err(io::Error::other(format!(
+                "ibv_poll_cq failed: {}",
+                io::Error::from_raw_os_error(-ret)
+            )));
+        }
+        for i in 0..ret as usize {
+            let ok = wc[i].status == IBV_WC_SUCCESS;
+            out[i] = Completion {
+                wr_id: wc[i].wr_id,
+                ok,
+                error: if ok {
+                    String::new()
+                } else {
+                    format!(
+                        "RDMA operation failed: {} (vendor error {})",
+                        status_str(wc[i].status),
+                        wc[i].vendor_err
+                    )
+                },
+            };
+        }
+        Ok(ret as usize)
+    }
+
+    fn event_fd(&self) -> Option<RawFd> {
+        // The completion channel's fd: readable when the armed queue
+        // fires a completion event.
+        Some(unsafe { (*self.inner.channel).fd })
+    }
+
+    fn arm(&mut self) -> io::Result<()> {
+        // ibv_req_notify_cq is a static inline call in verbs.h,
+        // dispatched through the device's command table, like
+        // ibv_post_send; a negative return is the errno. The event
+        // fires when a completion is ADDED after this — one already
+        // sitting in the queue does not — which is why the engine
+        // polls once more before blocking.
+        let req_notify = unsafe { (*(*self.inner.cq).context).ops.req_notify_cq };
+        check("ibv_req_notify_cq", unsafe { req_notify(self.inner.cq, 0) })
+    }
+
+    fn consume_events(&mut self) -> io::Result<()> {
+        // poll(2) said the channel is readable, so one event is
+        // pending; leftovers keep the channel readable, and the next
+        // block's poll returns at once — so exactly one get per
+        // readable poll, never a draining loop: a get without a
+        // pending event blocks.
+        let mut cq: *mut IbvCq = std::ptr::null_mut();
+        let mut cq_context: *mut c_void = std::ptr::null_mut();
+        let ret = unsafe { ibv_get_cq_event(self.inner.channel, &mut cq, &mut cq_context) };
+        if ret != 0 {
+            return Err(io::Error::other(format!(
+                "ibv_get_cq_event failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        // One ack per successful get, one-to-one: destroying the
+        // queue waits for every event to be acknowledged.
+        unsafe { ibv_ack_cq_events(cq, 1) };
+        Ok(())
     }
 }
 
@@ -1034,10 +1515,12 @@ impl Listener {
             id: child,
             cq: std::ptr::null_mut(),
             pd: None,
+            comp_channel: std::ptr::null_mut(),
             // The child id shares this listener's event channel, which
             // this connection must not destroy.
             event_channel: std::ptr::null_mut(),
-            next_wr_id: Cell::new(0),
+            shared: None,
+            pool: None,
         };
 
         let context = unsafe { (*child).verbs };
@@ -1051,7 +1534,9 @@ impl Listener {
             Some(pd) => pd.clone(),
             None => ProtectionDomain::alloc(context)?,
         };
-        conn.create_resources(pd)?;
+        // The provider side never posts one-sided operations, so its
+        // connections own their (inert) queues: no shared queue here.
+        conn.create_resources(pd, None)?;
         let mut param = conn_param();
         check("rdma_accept", unsafe { rdma_accept(conn.id, &mut param) })?;
         wait_event(self.event_channel, RDMA_CM_EVENT_ESTABLISHED, "rdma_accept")?;
@@ -1105,11 +1590,16 @@ mod tests {
         assert_eq!(offset_of!(IbvQp, context), 0);
         assert_eq!(size_of::<IbvCq>(), 8);
         assert_eq!(offset_of!(IbvCq, context), 0);
+        // The completion event channel: the context pointer, then the
+        // fd the engine blocks on.
+        assert_eq!(size_of::<IbvCompChannel>(), 16);
+        assert_eq!(offset_of!(IbvCompChannel, fd), 8);
         // The ops table: every entry is a pointer, with poll_cq at
-        // index 11 and post_send at index 25.
+        // index 11, req_notify_cq at 12, and post_send at 25.
         assert_eq!(size_of::<IbvContextOps>(), 208);
         assert_eq!(offset_of!(IbvContext, ops), 8);
         assert_eq!(offset_of!(IbvContextOps, poll_cq), 88);
+        assert_eq!(offset_of!(IbvContextOps, req_notify_cq), 96);
         assert_eq!(offset_of!(IbvContextOps, post_send), 200);
         assert_eq!(size_of::<SockaddrIn>(), 16);
         assert_eq!(offset_of!(SockaddrIn, sin_port), 2);

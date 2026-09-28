@@ -70,20 +70,23 @@ fn test_public_api() {
         let catalog = reader.get_remote_mr_metadata();
         let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
         // The whole region...
-        let whole = region.read(0, expected.len()).unwrap();
+        let whole = region.read_async(0, expected.len()).unwrap().wait().unwrap();
         assert_eq!(whole, expected);
         // ...and a slice of it at a byte offset, into a buffer we own.
-        let mut slice = vec![0u8; 8];
-        region.read_into(16, 8, &mut slice).unwrap();
+        let slice = region
+            .read_into_async(16, vec![0u8; 8])
+            .unwrap()
+            .wait()
+            .unwrap();
         assert_eq!(slice, expected[16..24]);
         println!("Done!");
         // Done reading: let node0 tear the provider down.
         synch.synch().unwrap();
         synch.synch().unwrap();
         // Node0 has rewritten the first 8 bytes; the rest is untouched.
-        let prefix = region.read(0, 8).unwrap();
+        let prefix = region.read_async(0, 8).unwrap().wait().unwrap();
         assert_eq!(prefix, vec![0xAA; 8]);
-        let rest = region.read(8, 56).unwrap();
+        let rest = region.read_async(8, 56).unwrap().wait().unwrap();
         assert_eq!(rest, expected[8..]);
         println!("Done 2!");
         synch.synch().unwrap();

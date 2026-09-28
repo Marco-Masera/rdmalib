@@ -8,12 +8,27 @@
 //!   [`ProtectionDomain`] share the rkeys of the memory registered in
 //!   it, which is how a group of readers gets shared access);
 //! - tuple creation, via [`ProtectionDomain::register`] /
-//!   [`ProtectionDomain::register_addr`] (or the [`Connection`]
-//!   equivalents), which registers a local buffer for remote access
-//!   and produces the (remote_addr, size, rkey) tuple remote readers
-//!   need;
-//! - one-sided reads and writes, via [`Connection::read`] and
-//!   [`Connection::write`].
+//!   [`ProtectionDomain::register_addr`], which registers a local
+//!   buffer for remote access and produces the (remote_addr, size,
+//!   rkey) tuple remote readers need;
+//! - shared completion queues, via [`SharedCompletions`] and
+//!   [`Connection::connect_shared`]: one queue per (engine, device),
+//!   every connection of the device posting into it, so the
+//!   operations engine drains them all from one poll site;
+//!   and
+//! - the connection's pooled registration (private to
+//!   `Connection::submit`): one allocation, registered once, its
+//!   slices lent to small operations — the engine's in-flight holds
+//!   — instead of a registration per operation.
+//!
+//! One-sided reads and writes are not commands of a connection
+//! anymore: they run through the operations engine
+//! ([`crate::Engine`], see `docs/async_engine.md`), which owns every
+//! connection registered with it and drives it through the engine's
+//! connection seam. The high-level reader side
+//! ([`crate::RemoteMemoryProvider`], [`crate::RemoteMemoryRegion`])
+//! does that driving; this module is the setup half — connections,
+//! domains, and tuples.
 //!
 //! The implementation is technology-specific and confined to a single
 //! module; the current one is built on libibverbs and rdma_cm.
@@ -30,23 +45,17 @@
 //! let listener = Listener::bind("10.0.0.1:18515").unwrap();
 //! let conn = listener.accept().unwrap();
 //! let buffer = vec![0u8; 4096];
-//! let mr = conn.register(&buffer).unwrap();
+//! let pd = conn.protection_domain();
+//! let mr = pd.register(&buffer).unwrap();
 //! let tuple = mr.tuple(); // (remote_addr, size, rkey) for the reader
 //!
-//! // Reader: connect and read into a locally registered buffer.
-//! // (In practice the tuple travels over the metadata channel — see
-//! // the high-level API.)
+//! // Reader: connect — then operate through the engine (the
+//! // high-level reader side wires this; in practice the tuple
+//! // travels over the metadata channel, and the operations are
+//! // `RemoteMemoryRegion`'s async reads and writes).
 //! let conn = Connection::connect("10.0.0.1:18515").unwrap();
-//! let dst = vec![0u8; 4096];
-//! let dst_mr = conn.register(&dst).unwrap();
-//! conn.read(&dst_mr, tuple.0, tuple.2, 4096).unwrap();
-//!
-//! // Writing back works the same way, source buffer first.
-//! let src = vec![0u8; 4096];
-//! let src_mr = conn.register(&src).unwrap();
-//! conn.write(&src_mr, tuple.0, tuple.2, 4096).unwrap();
 //! ```
 
 mod verbs;
 
-pub use verbs::{Connection, Listener, MemoryRegion, ProtectionDomain};
+pub use verbs::{Connection, Listener, MemoryRegion, ProtectionDomain, SharedCompletions};

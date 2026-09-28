@@ -102,7 +102,11 @@ fn test_public_api() {
         let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
 
         // Read only 150 elements out of the 1000, from 100 to 149
-        let smaller_buffer = region.read_typed::<Test>(100, 150).unwrap();
+        let smaller_buffer = region
+            .read_typed_async::<Test>(100, 150)
+            .unwrap()
+            .wait()
+            .unwrap();
         // check correctness
         assert_eq!(smaller_buffer.len(), 150);
         for (i, entry) in smaller_buffer.iter().enumerate() {
@@ -116,7 +120,11 @@ fn test_public_api() {
         synch.synch().unwrap();
 
         // Read again, this time position 0, which has been modified by writer
-        let tests2 = region.read_typed::<Test>(0, 1).unwrap();
+        let tests2 = region
+            .read_typed_async::<Test>(0, 1)
+            .unwrap()
+            .wait()
+            .unwrap();
         assert_eq!(tests2[0].x, 1000);
         println!("Done 2!");
         synch.synch().unwrap();
