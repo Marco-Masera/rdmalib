@@ -44,6 +44,9 @@
     },
     "read_write_test":{
       "nodes": [0, 1]
+    },
+    "read_async_multiple":{
+      "nodes": [0, 1]
     }
   }
 }

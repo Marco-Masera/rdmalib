@@ -130,6 +130,9 @@ impl InFlight for () {
 /// real one is `rdma::Connection` (see `rdma/verbs.rs`); the engine's
 /// tests inject fakes.
 ///
+/// `depth` is the connection's send-queue depth — the operations that
+/// may be in flight on it at once. Read once, at registration, to
+/// bound submissions: the engine never posts more than it.
 /// `submit` posts the operation over the local memory at
 /// `addr`..`addr+len` — registered, or pooled, however the half
 /// below chooses to hold it — tagged `wr_id`, and returns the
@@ -139,6 +142,7 @@ impl InFlight for () {
 /// shared completion source, until the connection is drained and
 /// dropped.
 pub(crate) trait OpSource: Send {
+    fn depth(&self) -> usize;
     fn submit(
         &mut self,
         op: Op,
@@ -241,12 +245,27 @@ struct Slot {
     claimed: bool,
 }
 
+/// One registered connection's load: its send-queue depth — the
+/// operations that may be in flight on it at once — and how many are
+/// in flight right now. The submission bound runs on it: a submit
+/// past the depth fails on the spot, eagerly, instead of a post
+/// failing on the engine thread when the device's queue is full (the
+/// `ibv_post_send` `ENOMEM` of a send queue out of work requests).
+struct ConnLoad {
+    depth: u32,
+    in_flight: u32,
+}
+
 /// The engine's operation slots. Allocation packs
 /// `(index << 32) | generation` into the wr_id the completion is
-/// routed by; freeing bumps the generation.
+/// routed by; freeing bumps the generation. The registered
+/// connections' loads ride along, under the same lock: the submit
+/// bound is a check-and-increment of the load, so no two submissions
+/// can slip past the depth of one connection.
 struct Slab {
     slots: Vec<Slot>,
     free: Vec<u32>,
+    conn_loads: HashMap<u32, ConnLoad>,
 }
 
 impl Slab {
@@ -478,6 +497,7 @@ impl Engine {
             slab: Mutex::new(Slab {
                 slots: Vec::new(),
                 free: Vec::new(),
+                conn_loads: HashMap::new(),
             }),
             wake_write,
             busy_window: Mutex::new(DEFAULT_BUSY_WINDOW),
@@ -515,6 +535,11 @@ impl Engine {
         source: Box<dyn OpSource>,
         completions: Option<Box<dyn CompletionSource>>,
     ) -> io::Result<u32> {
+        // The connection's send-queue depth, read here on the
+        // registering thread before the source moves to the engine:
+        // the submission bound needs it before the engine could have
+        // dispatched the registration.
+        let depth = source.depth() as u32;
         let conn = self
             .control
             .state
@@ -525,6 +550,15 @@ impl Engine {
             source,
             completions,
         })?;
+        // The load enters before the id returns, so the caller's very
+        // first submission on it already finds the bound in place.
+        self.control
+            .state
+            .slab
+            .lock()
+            .unwrap()
+            .conn_loads
+            .insert(conn, ConnLoad { depth, in_flight: 0 });
         Ok(conn)
     }
 
@@ -533,6 +567,21 @@ impl Engine {
     /// — then drop it, on the engine thread.
     pub(crate) fn destroy(&self, conn: u32) -> io::Result<()> {
         self.push(Command::Destroy { conn })
+    }
+
+    /// The connection's send-queue depth — the operations that may be
+    /// in flight on it at once; `None` once the connection is gone.
+    /// The bound [`Self::submit`] enforces, read back for the
+    /// reader-side accessors.
+    pub(crate) fn in_flight_limit(&self, conn: u32) -> Option<usize> {
+        self.control
+            .state
+            .slab
+            .lock()
+            .unwrap()
+            .conn_loads
+            .get(&conn)
+            .map(|load| load.depth as usize)
     }
 
     /// Submit one operation, eagerly: the checks run here — a
@@ -563,6 +612,25 @@ impl Engine {
         }
         let wr_id = {
             let mut slab = state.slab.lock().unwrap();
+            let Some(load) = slab.conn_loads.get_mut(&conn) else {
+                // The id was once registered (the never-registered
+                // are caught above) but its connection was destroyed
+                // and reaped: nothing of it is left to post through.
+                return Err(invalid(format!(
+                    "connection {conn} is gone (destroyed, and its operations flushed)"
+                )));
+            };
+            if load.in_flight >= load.depth {
+                // Eager, like every submission check: the send queue
+                // is full — await in-flight operations first. (This
+                // is the old C++ library's `Exceeded rdma completion
+                // queue size` guard, at the async seam.)
+                return Err(invalid(format!(
+                    "connection {conn}'s send queue is full: {} operations in flight, its max_send_wr is {} — await in-flight operations before submitting more",
+                    load.in_flight, load.depth
+                )));
+            }
+            load.in_flight += 1;
             slab.alloc(conn, submitted.buffer)
         };
         if let Err(error) = self.push(Command::Post {
@@ -574,8 +642,13 @@ impl Engine {
             len: submitted.len,
         }) {
             // The command never queued (the engine is shut down): the
-            // parked buffer is released here, on the submitting thread.
-            state.slab.lock().unwrap().free((wr_id >> 32) as u32);
+            // parked buffer is released here, on the submitting thread,
+            // and the load's in-flight count gives its slot back.
+            let mut slab = state.slab.lock().unwrap();
+            if let Some(load) = slab.conn_loads.get_mut(&conn) {
+                load.in_flight = load.in_flight.saturating_sub(1);
+            }
+            slab.free((wr_id >> 32) as u32);
             return Err(error);
         }
         Ok(OpHandle {
@@ -937,6 +1010,7 @@ impl EngineCore {
             let Some(slot) = slab.slot_of_mut(wr_id) else {
                 return; // stale: a reused slot never matches this generation
             };
+            let conn = slot.conn;
             let Some(flight) = slot.flight.take() else {
                 return; // already resolved (a duplicate completion)
             };
@@ -959,6 +1033,12 @@ impl EngineCore {
                 waker = slot.waker.take();
             } else {
                 slab.free(index);
+            }
+            // The work request completed — the send-queue slot is
+            // free again, whether the handle claims the result or
+            // the slot frees above.
+            if let Some(load) = slab.conn_loads.get_mut(&conn) {
+                load.in_flight = load.in_flight.saturating_sub(1);
             }
         }
         if let Some(waker) = waker {
@@ -1015,7 +1095,8 @@ impl EngineCore {
     }
 
     /// Drop the closed connections with nothing in flight — their
-    /// verbs teardown runs here, on the engine thread.
+    /// verbs teardown runs here, on the engine thread — and with them
+    /// their loads: nothing of the connection is left to bound.
     fn reap_closing(&mut self) {
         let reaped: Vec<u32> = self
             .sources
@@ -1026,6 +1107,7 @@ impl EngineCore {
             .collect();
         for conn in &reaped {
             self.sources.remove(conn);
+            self.state.slab.lock().unwrap().conn_loads.remove(conn);
         }
     }
 

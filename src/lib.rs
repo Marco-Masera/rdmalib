@@ -31,7 +31,7 @@ pub use providers::{
     SharedMemoryRegionProviderAddr,
 };
 pub use readers::{
-    RemoteMemoryProvider, RemoteMemoryProviderAddr, RemoteMemoryRegion,
+    RegionOp, RemoteMemoryProvider, RemoteMemoryProviderAddr, RemoteMemoryRegion,
     RemoteMemoryRegionMetadata,
 };
 

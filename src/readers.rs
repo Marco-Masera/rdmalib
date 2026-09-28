@@ -17,7 +17,15 @@
 //! select them, or [`RegionOp::wait`] it without an executor.
 
 use std::any::type_name;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+
+/// The send-queue depth a new session's connection posts with by
+/// default — how many operations may be in flight on it at once,
+/// before a submission fails the send-queue bound eagerly. The knob
+/// of [`RemoteMemoryProvider::set_max_send_wr`]; checked against the
+/// device (`max_qp_wr`) and the shared queue's completion budget at
+/// `update()`.
+const DEFAULT_MAX_SEND_WR: usize = 128;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -72,6 +80,11 @@ pub struct RemoteMemoryProvider {
     /// The engine that posts and polls every operation: the one the
     /// provider was built with, or its own unpinned default.
     engine: Engine,
+    /// The send-queue depth a new session's connection posts with —
+    /// the operations that may be in flight on it at once. The knob
+    /// of [`Self::set_max_send_wr`], checked at [`Self::update`]
+    /// against the device and the shared queue's completion budget.
+    max_send_wr: Cell<usize>,
     /// The shared completion queues, one per device the provider's
     /// connections landed on — every connection of a device posts
     /// its completions into its device's queue, and the engine drains
@@ -326,6 +339,36 @@ impl RemoteMemoryRegion {
     /// Submit an operation of `buffer.len()` bytes at `offset`
     /// through the group's engine-registered connection.
     ///
+    /// The operations that may be in flight on this region's
+    /// connection at once — its send-queue depth, the bound the
+    /// submission calls enforce (a submission past it fails, eagerly,
+    /// with the numbers in the message). All of a group's regions
+    /// share the one connection, so they share the bound; the knob is
+    /// [`RemoteMemoryProvider::set_max_send_wr`], and 0 once the
+    /// session is gone — re-establish it with
+    /// [`RemoteMemoryProvider::update`].
+    ///
+    /// ```no_run
+    /// # use rdmalib::{RemoteMemoryProvider, RemoteMemoryProviderAddr};
+    /// # let provider = RemoteMemoryProvider::new(
+    /// #     RemoteMemoryProviderAddr::new("10.0.0.1", 18515, 10000));
+    /// # provider.update(0).unwrap();
+    /// # let catalog = provider.get_remote_mr_metadata();
+    /// # let region = provider.get_remote_mr(&catalog[0], Some(0)).unwrap();
+    /// // Submit at most this many before awaiting some:
+    /// let ops: Vec<_> = (0..region.max_in_flight())
+    ///     .map(|i| region.read_async(i * 4096, 4096))
+    ///     .collect::<std::io::Result<Vec<_>>>()
+    ///     .unwrap();
+    /// ```
+    pub fn max_in_flight(&self) -> usize {
+        let connection = self.connection.borrow();
+        match connection.conn {
+            Some(conn) => connection.engine.in_flight_limit(conn).unwrap_or(0),
+            None => 0,
+        }
+    }
+
     /// The bounds and layout checks ran in the callers; what is left
     /// is the connection check — no session, no operation — and the
     /// eager engine submission, from this thread.
@@ -491,6 +534,7 @@ impl RemoteMemoryProvider {
         Self {
             addr,
             engine,
+            max_send_wr: Cell::new(DEFAULT_MAX_SEND_WR),
             completions: RefCell::new(Vec::new()),
             sessions: RefCell::new(HashMap::new()),
             metadata: RefCell::new(Vec::new()),
@@ -498,7 +542,43 @@ impl RemoteMemoryProvider {
         }
     }
 
-    /// Metadata of the remote memory regions known to this provider.
+    /// Set the send-queue depth of the connections this provider
+    /// establishes — how many operations may be in flight on one at
+    /// once ([`DEFAULT_MAX_SEND_WR`] by default). A submission past
+    /// the depth fails, eagerly and clearly, at the submission call.
+    ///
+    /// The request is checked at the next [`Self::update`] — the
+    /// earliest point the hardware is known — against the device's
+    /// `max_qp_wr` and the shared completion queue's remaining
+    /// budget (the depths of a device's live connections must sum
+    /// under its queue, so a completion burst from all of them never
+    /// overruns it); a request past either is rejected there, with
+    /// both numbers in the message. [`Self::device_max_qp_wr`] tells
+    /// the hardware ceiling once a session has run. Applies to the
+    /// sessions established after this call.
+    ///
+    /// ```no_run
+    /// # use rdmalib::{RemoteMemoryProvider, RemoteMemoryProviderAddr};
+    /// let addr = RemoteMemoryProviderAddr::new("10.0.0.1", 18515, 10000);
+    /// let provider = RemoteMemoryProvider::new(addr);
+    /// provider.set_max_send_wr(512); // the default is 128
+    /// provider.update(0).unwrap();    // would reject 512 past the device's max_qp_wr
+    /// ```
+    pub fn set_max_send_wr(&self, max: usize) {
+        self.max_send_wr.set(max);
+    }
+
+    /// The hardware ceiling of [`Self::set_max_send_wr`]: the
+    /// smallest per-queue-pair work-request cap (`max_qp_wr`) of the
+    /// devices this provider's sessions landed on. `None` before any
+    /// session ran.
+    pub fn device_max_qp_wr(&self) -> Option<u32> {
+        self.completions.borrow().iter().map(|sc| sc.max_qp_wr()).min()
+    }
+
+    /// Metadata of the remote memory regions known to this provider,
+    /// in the order the remote serves the catalog: registration
+    /// order (by id).
     pub fn get_remote_mr_metadata(&self) -> Vec<RemoteMemoryRegionMetadata> {
         self.metadata.borrow().clone()
     }
@@ -572,6 +652,7 @@ impl RemoteMemoryProvider {
             let (connection, new_completions) = rdma::Connection::connect_shared(
                 (self.addr.address.as_str(), self.addr.rdma_port),
                 &self.completions.borrow(),
+                self.max_send_wr.get(),
             )?;
             let engine_completions = match new_completions {
                 Some(shared) => {

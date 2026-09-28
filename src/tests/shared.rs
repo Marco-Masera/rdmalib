@@ -118,3 +118,61 @@ fn zero_sized_elements_are_rejected() {
     let provider = provider();
     let _ = provider.register_typed("empty", vec![Empty; 3]);
 }
+
+#[test]
+fn the_served_catalog_is_sorted_by_id() {
+    use crate::providers::{ordered_catalog, RegionInfo};
+    use std::collections::HashMap;
+
+    // A catalog as scrambled as a `HashMap` can leave it: ids out of
+    // order, non-contiguous. The serving order is the id order —
+    // registration order — whatever the map's iteration order
+    // happens to be (it is randomized per process, which is the bug
+    // this pins: a served order taken from the iteration order flips
+    // per run).
+    let info = |name: &str| RegionInfo {
+        name: name.to_owned(),
+        remote_addr: 0,
+        size: 0,
+        elem_size: 1,
+        elem_align: 1,
+        elem_type: "u8".to_owned(),
+    };
+    let mut catalog = HashMap::new();
+    catalog.insert(2, info("c"));
+    catalog.insert(0, info("a"));
+    catalog.insert(5, info("f"));
+    catalog.insert(1, info("b"));
+    let served: Vec<u32> = ordered_catalog(&catalog).iter().map(|&(id, _)| id).collect();
+    assert_eq!(served, [0, 1, 2, 5]);
+}
+
+#[test]
+fn the_exchange_serves_the_catalog_in_registration_order() {
+    use crate::meta::Message;
+
+    let provider = provider();
+    // Registered out of name order, so the id order is not the name
+    // order: what a session is served is the registration order.
+    // (No reader has been accepted into group 0, so no group exists,
+    // so no tuple is created — the exchange runs without hardware.)
+    let b = provider.register(SharedMemoryRegionMetadata::new("b", vec![0; 8]));
+    let a = provider.register(SharedMemoryRegionMetadata::new("a", vec![0; 8]));
+
+    let (catalog, tuples) = provider.served_exchange(0);
+    let Message::Metadata { regions } = catalog else {
+        panic!("the exchange serves the catalog first");
+    };
+    let Message::Tuples { group, tuples } = tuples else {
+        panic!("the exchange serves the tuples second");
+    };
+    assert_eq!(group, 0);
+    assert!(tuples.is_empty());
+    assert_eq!(
+        regions
+            .iter()
+            .map(|region| (region.id, region.name.as_str()))
+            .collect::<Vec<_>>(),
+        [(b.id(), "b"), (a.id(), "a")]
+    );
+}

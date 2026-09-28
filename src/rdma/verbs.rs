@@ -30,10 +30,13 @@ const RESOLVE_TIMEOUT_MS: c_int = 2000;
 /// created with as many send work requests.
 const CQ_SIZE: c_int = 16;
 
-/// Depth of a shared completion queue — one per (engine, device),
-/// fed by every connection on the device, so sized for all of them
-/// at once (the sweep drains it in batches, long before it fills).
-const SHARED_CQ_SIZE: c_int = 256;
+/// The floor of a shared completion queue's depth, in entries — the
+/// depth the first connection on a device creates the queue with
+/// (raised to that connection's request if larger, capped by the
+/// device's `max_cqe`): a few default-depth connections then share
+/// one queue without budget rejects. Completion entries are host
+/// memory, so the floor is cheap.
+const SHARED_CQ_SIZE: usize = 1024;
 
 /// Byte size of one pooled operation slice: operations at most this
 /// large run through the connection's pooled registration — copied
@@ -274,6 +277,36 @@ struct IbvQpInitAttr {
     sq_sig_all: c_int,
 }
 
+/// Device attributes (`struct ibv_device_attr`), the leading fields
+/// through `max_cqe` — the caps the queue sizing needs (`max_qp_wr`,
+/// the per-queue-pair work-request ceiling, is the send-queue depth
+/// cap; `max_cqe` the completion-queue entry cap) plus everything
+/// before them the kernel writes over. The rest of the struct the
+/// kernel writes too, so the mirror carries it as unread tail and
+/// must stay full-size (232 bytes): a short buffer would have the
+/// kernel write past it.
+#[repr(C)]
+struct IbvDeviceAttr {
+    fw_ver: [u8; 64],
+    node_guid: u64,
+    sys_image_guid: u64,
+    max_mr_size: u64,
+    page_size_cap: u64,
+    vendor_id: u32,
+    vendor_part_id: u32,
+    hw_ver: u32,
+    max_qp: i32,
+    max_qp_wr: i32,
+    device_cap_flags: u32,
+    max_sge: i32,
+    max_sge_rd: i32,
+    max_cq: i32,
+    max_cqe: i32,
+    /// The fields past `max_cqe`, written by the query, read by no
+    /// one here.
+    _tail: [u8; 232 - 136],
+}
+
 /// A communication identifier (`struct rdma_cm_id`); only the leading
 /// fields accessed by this implementation are declared.
 #[repr(C)]
@@ -355,6 +388,10 @@ unsafe extern "C" {
     fn ibv_ack_cq_events(cq: *mut IbvCq, nevents: c_uint);
     fn ibv_reg_mr(pd: *mut IbvPd, addr: *mut c_void, length: usize, access: c_int) -> *mut IbvMr;
     fn ibv_dereg_mr(mr: *mut IbvMr) -> c_int;
+    fn ibv_query_device(
+        context: *mut IbvContext,
+        device_attr: *mut IbvDeviceAttr,
+    ) -> c_int;
     fn ibv_wc_status_str(status: c_int) -> *const c_char;
 }
 
@@ -410,6 +447,22 @@ fn check_ptr<T>(call: &str, ptr: *mut T) -> io::Result<*mut T> {
     } else {
         Ok(ptr)
     }
+}
+
+/// Query the device's attributes — the caps the queue sizing runs
+/// on: `max_qp_wr`, the per-queue-pair work-request ceiling every
+/// send-queue depth is checked against, and `max_cqe`, the
+/// completion-queue entry ceiling a queue's depth clamps to. The
+/// rest of the attributes the query writes, the mirror carries as
+/// unread tail. The return is 0, or the value of `errno` — `check`'s
+/// convention exactly.
+fn query_device(context: *mut IbvContext) -> io::Result<IbvDeviceAttr> {
+    let mut attr: IbvDeviceAttr = unsafe { std::mem::zeroed() };
+    check(
+        "ibv_query_device",
+        unsafe { ibv_query_device(context, &mut attr) },
+    )?;
+    Ok(attr)
 }
 
 fn invalid(msg: impl Into<String>) -> io::Error {
@@ -703,6 +756,12 @@ pub struct Connection {
     /// alive until this queue pair is destroyed; without one, the
     /// connection owns its queue and channel itself.
     shared: Option<SharedCompletions>,
+    /// The send-queue depth this connection posts with — the
+    /// operations that may be in flight on it at once. Set at resource
+    /// creation; the send-queue bound of the engine's submissions
+    /// (see `docs/async_engine.md`) reads it through
+    /// [`Self::depth`].
+    max_send_wr: usize,
     /// The connection's pooled registration, created lazily at the
     /// first pooled operation (see [`Pool`]); absent until then.
     pool: Option<Pool>,
@@ -720,9 +779,11 @@ impl Connection {
     ///
     /// Resolves the address and route, creates the connection
     /// resources — the connection's own completion queue — and
-    /// establishes the connection. For the engine's shared queue, use
+    /// establishes the connection. `max_send_wr` is the send-queue
+    /// depth it posts with, the operations that may be in flight on
+    /// it at once. For the engine's shared queue, use
     /// [`Self::connect_shared`].
-    pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+    pub fn connect<A: ToSocketAddrs>(addr: A, max_send_wr: usize) -> io::Result<Self> {
         let mut dst = SockaddrIn::from(resolve_v4(addr)?);
         let event_channel =
             check_ptr("rdma_create_event_channel", unsafe { rdma_create_event_channel() })?;
@@ -733,9 +794,10 @@ impl Connection {
             comp_channel: std::ptr::null_mut(),
             event_channel,
             shared: None,
+            max_send_wr: 0,
             pool: None,
         };
-        conn.connect_to(&mut dst, &[])?;
+        conn.connect_to(&mut dst, &[], max_send_wr)?;
         Ok(conn)
     }
 
@@ -749,9 +811,18 @@ impl Connection {
     /// Every connection of one engine on one device shares one queue
     /// that way, so the engine's one poll drains them all,
     /// interleaved in arrival order (see `docs/async_engine.md`).
+    ///
+    /// `max_send_wr` is the send-queue depth the connection posts
+    /// with — the operations that may be in flight on it at once. It
+    /// is checked here, against the device's `max_qp_wr` and the
+    /// shared queue's remaining completion budget (the sum rule:
+    /// every live connection's depth sums under the queue's depth),
+    /// and a request past either is rejected — surfacing at the
+    /// caller's `update` — with both numbers in the message.
     pub fn connect_shared<A: ToSocketAddrs>(
         addr: A,
         shared: &[SharedCompletions],
+        max_send_wr: usize,
     ) -> io::Result<(Self, Option<SharedCompletions>)> {
         let mut dst = SockaddrIn::from(resolve_v4(addr)?);
         let event_channel =
@@ -763,9 +834,10 @@ impl Connection {
             comp_channel: std::ptr::null_mut(),
             event_channel,
             shared: None,
+            max_send_wr: 0,
             pool: None,
         };
-        let new_shared = conn.connect_to(&mut dst, shared)?;
+        let new_shared = conn.connect_to(&mut dst, shared, max_send_wr)?;
         Ok((conn, new_shared))
     }
 
@@ -773,10 +845,13 @@ impl Connection {
     /// is dropped by the caller, releasing the resources created so
     /// far. Completes into the first of `shared` on this connection's
     /// device, or a fresh one it creates (and returns) for it.
+    /// `max_send_wr` is the checked send-queue depth — see
+    /// [`Self::connect_shared`].
     fn connect_to(
         &mut self,
         dst: &mut SockaddrIn,
         shared: &[SharedCompletions],
+        max_send_wr: usize,
     ) -> io::Result<Option<SharedCompletions>> {
         check(
             "rdma_create_id",
@@ -810,15 +885,21 @@ impl Connection {
         let context = unsafe { (*self.id).verbs };
         let pd = ProtectionDomain::alloc(context)?;
         // The device is known only now, after the route resolved: pick
-        // the shared queue living on it, or create one for it.
+        // the shared queue living on it, or create one for it — sized
+        // by this connection's request (the queue cannot grow after
+        // creation, so the first connection's request sizes it).
         let (shared, new) = match shared.iter().find(|sc| sc.context() == context) {
             Some(sc) => (Some(sc.clone()), None),
             None => {
-                let sc = SharedCompletions::on_device(context)?;
+                let sc = SharedCompletions::on_device(context, max_send_wr)?;
                 (Some(sc.clone()), Some(sc))
             }
         };
-        self.create_resources(pd, shared.as_ref())?;
+        // The send-queue depth, lent out of the queue's completion
+        // budget — the caps of the lend (the device's `max_qp_wr`, the
+        // budget) reject a request past either here.
+        shared.as_ref().unwrap().lend(max_send_wr)?;
+        self.create_resources(pd, shared.as_ref(), max_send_wr)?;
         let mut param = conn_param();
         check("rdma_connect", unsafe { rdma_connect(self.id, &mut param) })?;
         wait_event(self.event_channel, RDMA_CM_EVENT_ESTABLISHED, "rdma_connect")?;
@@ -837,7 +918,14 @@ impl Connection {
         &mut self,
         pd: ProtectionDomain,
         shared: Option<&SharedCompletions>,
+        max_send_wr: usize,
     ) -> io::Result<()> {
+        // The shared queue first, before anything that can fail: the
+        // connection returns its lent send-queue depth to the queue's
+        // budget in `Drop`, through this field — a failure after the
+        // lend must not skip it. (A failure before it tears the whole
+        // fresh queue down instead, lending nothing that survives.)
+        self.shared = shared.cloned();
         let cq = match shared {
             Some(sc) => sc.raw_cq(),
             None => {
@@ -852,20 +940,24 @@ impl Connection {
                 )?;
                 self.comp_channel = comp_channel;
                 self.cq = cq;
-                self.shared = None;
                 cq
             }
         };
 
         // A reliable connection signaling every send, like the C
         // library: each read completion is then always reported.
+        // `max_send_wr` is the send-queue depth — the operations that
+        // may be in flight at once, bounded by the lend that checked
+        // it against the device and the queue's budget; the receive
+        // side never posts (one-sided operations only), so its depth
+        // stays nominal.
         let mut attr = IbvQpInitAttr {
             qp_context: std::ptr::null_mut(),
             send_cq: cq,
             recv_cq: cq,
             srq: std::ptr::null_mut(),
             cap: IbvQpCap {
-                max_send_wr: CQ_SIZE as u32,
+                max_send_wr: max_send_wr as u32,
                 max_recv_wr: CQ_SIZE as u32,
                 max_send_sge: 1,
                 max_recv_sge: 1,
@@ -879,7 +971,7 @@ impl Connection {
             unsafe { rdma_create_qp(self.id, pd.raw(), &mut attr) },
         )?;
         self.pd = Some(pd);
-        self.shared = shared.cloned();
+        self.max_send_wr = max_send_wr;
         Ok(())
     }
 
@@ -888,6 +980,13 @@ impl Connection {
     /// created in the same domain (see [`Listener::accept_into`]).
     pub fn protection_domain(&self) -> ProtectionDomain {
         self.pd.clone().expect("the connection is established")
+    }
+
+    /// The send-queue depth this connection posts with — the
+    /// operations that may be in flight on it at once. The engine's
+    /// submission bound runs on it (see `docs/async_engine.md`).
+    pub fn depth(&self) -> usize {
+        self.max_send_wr
     }
 
     /// Register the memory at `addr`..`addr + size` in this
@@ -1009,6 +1108,13 @@ impl Drop for Connection {
                 rdma_destroy_event_channel(self.event_channel);
             }
         }
+        // The lent send-queue depth returns only now, after the queue
+        // pair is destroyed: its work requests can complete no more,
+        // so its share of the shared queue's completion budget is
+        // free for the next connection of the device.
+        if let Some(sc) = &self.shared {
+            sc.return_budget(self.max_send_wr);
+        }
     }
 }
 
@@ -1027,6 +1133,10 @@ impl fmt::Debug for Connection {
 /// [`SharedCompletions`] the connection posts into, as a
 /// [`CompletionSource`].
 impl OpSource for Connection {
+    fn depth(&self) -> usize {
+        self.max_send_wr
+    }
+
     fn submit(
         &mut self,
         op: Op,
@@ -1280,33 +1390,58 @@ struct ScInner {
     context: *mut IbvContext,
     cq: *mut IbvCq,
     channel: *mut IbvCompChannel,
+    /// The device's per-queue-pair work-request ceiling, queried once
+    /// at creation — the hardware cap every connection's requested
+    /// send-queue depth is checked against (see [`SharedCompletions::lend`]).
+    max_qp_wr: u32,
+    /// The device's completion-queue entry ceiling, likewise — the
+    /// queue's own depth was clamped to it at creation. Read at
+    /// creation only; kept for diagnostics.
+    #[allow(dead_code)]
+    max_cqe: u32,
+    /// The completion budget, `(lent, depth)`: the sum of the send-queue
+    /// depths lent to live connections, under the queue's depth — the
+    /// sum rule, so a simultaneous completion burst from every
+    /// connection cannot overrun the queue. Behind a mutex: a
+    /// connection lends on its owner's thread, a dead one returns its
+    /// depth on the engine thread (its drop).
+    budget: Mutex<(usize, usize)>,
 }
 
 // SAFETY: the wrapped queue has no thread affinity, and the verbs API
 // permits a CQ to be referenced (queue pairs created on it) from
 // several threads; polling stays on the engine thread, destruction
-// exclusive by the `Arc` refcount. This is what lets clones of the
-// handle live on different threads — and why the handle must stay on
-// `Arc`, whose atomic refcount that relies on.
+// exclusive by the `Arc` refcount. The rest is plain data behind the
+// budget mutex. This is what lets clones of the handle live on
+// different threads — and why the handle must stay on `Arc`, whose
+// atomic refcount that relies on.
 unsafe impl Send for ScInner {}
 unsafe impl Sync for ScInner {}
 
 impl SharedCompletions {
-    /// A shared queue of `SHARED_CQ_SIZE` entries on `context`'s
-    /// device.
-    fn on_device(context: *mut IbvContext) -> io::Result<Self> {
+    /// A shared queue on `context`'s device, `min_depth` entries deep
+    /// — at least [`SHARED_CQ_SIZE`], at least the first connection's
+    /// request, never past the device's `max_cqe` (queried here, once
+    /// per queue) — with its caps remembered for the later
+    /// connections' depth checks.
+    fn on_device(context: *mut IbvContext, min_depth: usize) -> io::Result<Self> {
+        let attr = query_device(context)?;
+        let depth = SHARED_CQ_SIZE.max(min_depth).min(attr.max_cqe.max(0) as usize);
         let channel = check_ptr("ibv_create_comp_channel", unsafe {
             ibv_create_comp_channel(context)
         })?;
         let cq = check_ptr(
             "ibv_create_cq",
-            unsafe { ibv_create_cq(context, SHARED_CQ_SIZE, std::ptr::null_mut(), channel, 0) },
+            unsafe { ibv_create_cq(context, depth as c_int, std::ptr::null_mut(), channel, 0) },
         )?;
         Ok(Self {
             inner: Arc::new(ScInner {
                 context,
                 cq,
                 channel,
+                max_qp_wr: attr.max_qp_wr.max(0) as u32,
+                max_cqe: attr.max_cqe.max(0) as u32,
+                budget: Mutex::new((0, depth)),
             }),
         })
     }
@@ -1320,6 +1455,47 @@ impl SharedCompletions {
     /// this shared queue.
     fn raw_cq(&self) -> *mut IbvCq {
         self.inner.cq
+    }
+
+    /// The device's per-queue-pair work-request ceiling — the
+    /// hardware cap of every send-queue depth lent from this queue's
+    /// device.
+    pub fn max_qp_wr(&self) -> u32 {
+        self.inner.max_qp_wr
+    }
+
+    /// Lend `request` entries of the queue's completion budget to a
+    /// new connection — the send-queue depth it posts with. Two caps,
+    /// a request past either rejected with both numbers named: the
+    /// device's `max_qp_wr`, and the budget remaining after the
+    /// depths lent to the device's live connections (the sum rule:
+    /// every live connection's send-queue depth must sum under the
+    /// queue's depth, or a simultaneous completion burst overruns
+    /// it).
+    fn lend(&self, request: usize) -> io::Result<()> {
+        if request > self.inner.max_qp_wr as usize {
+            return Err(invalid(format!(
+                "max_send_wr {request} exceeds the device's max_qp_wr {}",
+                self.inner.max_qp_wr
+            )));
+        }
+        let mut budget = self.inner.budget.lock().unwrap();
+        let remaining = budget.1.saturating_sub(budget.0);
+        if request > remaining {
+            return Err(invalid(format!(
+                "max_send_wr {request} exceeds the shared completion queue's remaining budget: queue depth {}, already lent {}, remaining {remaining}",
+                budget.1, budget.0
+            )));
+        }
+        budget.0 += request;
+        Ok(())
+    }
+
+    /// Return a dead connection's lent depth to the queue's budget —
+    /// its share is free again once its queue pair is gone.
+    fn return_budget(&self, depth: usize) {
+        let mut budget = self.inner.budget.lock().unwrap();
+        budget.0 = budget.0.saturating_sub(depth);
     }
 }
 
@@ -1520,6 +1696,7 @@ impl Listener {
             // this connection must not destroy.
             event_channel: std::ptr::null_mut(),
             shared: None,
+            max_send_wr: 0,
             pool: None,
         };
 
@@ -1535,8 +1712,9 @@ impl Listener {
             None => ProtectionDomain::alloc(context)?,
         };
         // The provider side never posts one-sided operations, so its
-        // connections own their (inert) queues: no shared queue here.
-        conn.create_resources(pd, None)?;
+        // connections own their (inert) queues: no shared queue here,
+        // and a nominal send-queue depth — the bound never bites.
+        conn.create_resources(pd, None, CQ_SIZE as usize)?;
         let mut param = conn_param();
         check("rdma_accept", unsafe { rdma_accept(conn.id, &mut param) })?;
         wait_event(self.event_channel, RDMA_CM_EVENT_ESTABLISHED, "rdma_accept")?;
@@ -1586,6 +1764,19 @@ mod tests {
         assert_eq!(offset_of!(IbvWc, status), 8);
         assert_eq!(size_of::<IbvQpCap>(), 20);
         assert_eq!(size_of::<IbvQpInitAttr>(), 64);
+        // The device attributes: the mirror must be full-size (the
+        // kernel writes the whole struct), with the caps the queue
+        // sizing reads at the offsets the header's field order gives
+        // — fw_ver[64], five u64s, three u32s, then max_qp at 108 and
+        // max_qp_wr at 112, then max_cq at 128 and max_cqe at 132.
+        assert_eq!(size_of::<IbvDeviceAttr>(), 232);
+        assert_eq!(offset_of!(IbvDeviceAttr, node_guid), 64);
+        assert_eq!(offset_of!(IbvDeviceAttr, vendor_id), 96);
+        assert_eq!(offset_of!(IbvDeviceAttr, max_qp), 108);
+        assert_eq!(offset_of!(IbvDeviceAttr, max_qp_wr), 112);
+        assert_eq!(offset_of!(IbvDeviceAttr, device_cap_flags), 116);
+        assert_eq!(offset_of!(IbvDeviceAttr, max_cq), 128);
+        assert_eq!(offset_of!(IbvDeviceAttr, max_cqe), 132);
         assert_eq!(size_of::<IbvQp>(), 8);
         assert_eq!(offset_of!(IbvQp, context), 0);
         assert_eq!(size_of::<IbvCq>(), 8);

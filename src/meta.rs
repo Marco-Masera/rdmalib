@@ -68,7 +68,7 @@ pub(crate) enum Message {
     /// tuples.
     Update,
     /// Provider → reader: the region catalog, every registered
-    /// region.
+    /// region, in registration order (by id).
     Metadata {
         regions: Vec<RegionDesc>,
     },

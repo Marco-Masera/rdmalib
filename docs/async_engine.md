@@ -30,7 +30,14 @@ at most `POOL_ENTRY` bytes bounce through pooled slices (a copy in
 at post for a write, a copy out at the hold's finish for a read)
 instead of a registration per operation; larger ones, and ones
 that find the pool fully lent out, register directly, exactly as
-before the pool.
+before the pool. Over the send-queue depth: the hardware's caps
+queried (`ibv_query_device`, once per device's shared queue —
+`max_qp_wr`, `max_cqe`), the knob
+(`RemoteMemoryProvider::set_max_send_wr`, default 128), the
+reject-with-the-numbers check at `update()` (the device's
+`max_qp_wr`, the shared queue's completion budget — the sum rule),
+and the eager submission bound (a submit past the connection's
+depth fails on the spot, with the numbers in the message).
 
 Goals and invariants not restated here live in `AGENTS.md`; this doc
 extends them with the operations path: one-sided reads and writes as
@@ -114,8 +121,16 @@ async operations, polled by one pinned, library-owned engine thread.
 ### Ops, slots, wr_ids
 
 - Submission (on the provider's home thread): bounds/layout/no-session
-  checks → allocate a slab slot `(index, generation)` → move the buffer
-  into the slot → push `Post` → wake the pipe.
+  checks → the send-queue bound (a submit past the connection's
+  depth — the operations in flight on it — fails here, eagerly, with
+  the numbers in the message; the load, `depth`/`in_flight`, lives in
+  the slab state, checked-and-incremented under its one lock) →
+  allocate a slab slot `(index, generation)` → move the buffer into
+  the slot → push `Post` → wake the pipe. The bound follows
+  completions: the count drops at resolve, whether or not the handle
+  claims the result. This is the old C++ library's
+  `Exceeded rdma completion queue size` guard (`ops.cpp`), at the
+  async seam.
 - `wr_id = (slot_index << 32) | generation` — engine-wide unique, so
   completions route without consulting any connection state; the
   per-connection `next_wr_id` counter disappears.
@@ -150,17 +165,72 @@ async operations, polled by one pinned, library-owned engine thread.
   hold `Box<dyn Any + Send>`, handles downcast on pickup — never a
   transmute of the `Vec` itself.
 
+### Send-queue depth, and its bound
+
+Each connection posts with a send-queue depth — the operations that
+may be in flight on it at once. The engine enforces it at
+submission, eagerly: a submit past the depth fails on the spot
+(`InvalidInput`, the numbers in the message), instead of the device
+rejecting the post (`ibv_post_send` `ENOMEM` of a send queue out of
+work requests) and the failure surfacing as the op's completion.
+The bound follows completions: the count drops at resolve, whether
+or not the handle claims the result, so the slot frees as work
+completes, not as handles drop.
+
+Where the depth comes from:
+
+- The knob: `RemoteMemoryProvider::set_max_send_wr(n)` (default
+  `DEFAULT_MAX_SEND_WR = 128`), applied to the sessions established
+  after the call. `RemoteMemoryRegion::max_in_flight()` reads the
+  effective bound back.
+
+```rust
+let provider = RemoteMemoryProvider::with_engine(addr, engine.clone());
+provider.set_max_send_wr(512);           // default: 128
+provider.update(0)?;                      // may reject — see below
+let region = provider.get_remote_mr(&catalog[0], Some(0))?;
+
+// Submit at most this many before awaiting some —
+// a submit past the depth fails, eagerly, with the numbers:
+let ops: Vec<_> = (0..region.max_in_flight())
+    .map(|i| region.read_async(i * 4096, 4096))
+    .collect::<io::Result<Vec<_>>>()?;
+let error = region.read_async(0, 4096).unwrap_err(); // "send queue is full: …"
+```
+
+- The hardware: `ibv_query_device` at the device's shared-queue
+  creation (`rdma::SharedCompletions`), once per (engine, device) —
+  `max_qp_wr` (the per-QP work-request ceiling) and `max_cqe` (the
+  CQ entry ceiling) are stored on the queue;
+  `RemoteMemoryProvider::device_max_qp_wr()` exposes the ceiling
+  once a session has run.
+- The check, at `update()` — the earliest point the hardware is
+  known — rejects (never silently clamps) a request past either cap,
+  with both numbers in the message: the device's `max_qp_wr`, and
+  the shared queue's remaining completion budget.
+- The budget: the depths of a device's live connections must sum
+  under its shared queue's depth (a simultaneous completion burst
+  from every connection must fit), or the queue overruns
+  (`IBV_EVENT_CQ_ERR` — resolved loudly by the engine's completion
+  failure path). A connection lends at connect and returns its share
+  at drop, under one mutex, so the budget is exact at any moment.
+  The queue is sized once per device — `max(SHARED_CQ_SIZE = 1024,
+  the first connection's request)`, capped by `max_cqe` — because a
+  CQ cannot grow while queue pairs feed it: a later, larger request
+  than the first one's must fit the remaining budget.
+
 ### Poll loop
 
-- Round-robin sweep: each registered CQ in rotation, bounded batch per
-  CQ per sweep; process completions; sweep again.
+- Sweep of the completion sources, one per (engine, device), rotated
+  across devices only — a single poll site in the common
+  single-device case; bounded batch per source per sweep; process
+  completions; sweep again.
 - While slots are pending: busy-poll within a bounded window
   (configurable; the dedicated-core/HPC case can ask for pure busy).
 - Idle: hybrid fd-block —
   1. arm every CQ (`ibv_req_notify_cq`) **before** blocking, or the
      engine sleeps on a completion it already holds;
-  2. `poll(2)` on [wake-pipe read end, per-connection comp-channel
-     fds];
+  2. `poll(2)` on [wake-pipe read end, per-device comp-channel fds];
   3. on a comp-channel event: `ibv_get_cq_event`, `ibv_ack_cq_events`,
      then drain that CQ to empty (events coalesce; more completions
      may have landed since arming — the ack-then-drain pattern from
@@ -300,6 +370,11 @@ let buffer = region.read_async(0, 4096)?.wait()?;
    pool fully lent out, register directly. The seam holds: the
    engine's in-flight hold (`InFlight`, per operation) is finished
    — copy out, release — before the operation's buffer resolves.
+6. **(done)** The send-queue depth, its hardware caps, its knob, and
+   its eager submission bound (see "Send-queue depth, and its
+   bound" above): `ibv_query_device` per device
+   (`max_qp_wr`/`max_cqe`), `set_max_send_wr` (default 128),
+   reject-with-the-numbers at `update()`, the bound at submit.
 
 ## Open questions
 
@@ -313,10 +388,12 @@ let buffer = region.read_async(0, 4096)?.wait()?;
 - Should session threads (update-wait) pin to the engine's CPU too?
 - QP liveness against a stalled remote: defaults accept indefinite
   stalls; engine-side rnr/ack timeout policy is a knob to consider.
-- CQ depth: `SHARED_CQ_SIZE = 256` — one shared queue per (engine,
-  device) now bounds the outstanding ops of every connection on the
-  device at once; a real sizing knob and an overrun policy remain
-  open.
+- CQ depth: dynamic since step 6 — `max(SHARED_CQ_SIZE = 1024, the
+  first connection's request)`, capped by the device's `max_cqe`,
+  with the live connections' depths kept under it by the lend/return
+  budget. The residual knob: the 1024 floor is a fixed guess, and
+  the budget is per shared queue (one per device) — a per-engine
+  CQ-budget knob could follow.
 - Pool sizing: `POOL_ENTRY = 128 KiB` / `POOL_SLOTS = 32` (4 MiB
   pinned per connection, created lazily) are fixed guesses — the
   copy-vs-registration crossover, per device, is measurable; knobs

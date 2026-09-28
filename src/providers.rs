@@ -148,20 +148,24 @@ pub struct SharedMemoryRegionHandle<T = u8> {
 /// tuples are created from the address captured at registration, so
 /// the service never touches a buffer the application may be
 /// borrowing.
+///
+/// `pub(crate)` for the catalog-ordering seam: the served order is a
+/// library guarantee, pinned in `src/tests/shared.rs` through
+/// [`ordered_catalog`].
 #[derive(Debug, Clone)]
-struct RegionInfo {
-    name: String,
+pub(crate) struct RegionInfo {
+    pub(crate) name: String,
     /// The region's buffer address, in bytes, captured at
     /// registration.
-    remote_addr: u64,
+    pub(crate) remote_addr: u64,
     /// The region's buffer size, in bytes.
-    size: usize,
+    pub(crate) size: usize,
     /// `size_of` of the element type the region is shared as.
-    elem_size: u32,
+    pub(crate) elem_size: u32,
     /// `align_of` of the element type the region is shared as.
-    elem_align: u32,
+    pub(crate) elem_align: u32,
     /// `std::any::type_name` of the element type, for diagnostics.
-    elem_type: String,
+    pub(crate) elem_type: String,
 }
 
 /// Internal bookkeeping for one group of readers: they share the
@@ -182,7 +186,9 @@ struct GroupEntry {
 /// the tuples they create for those groups.
 #[derive(Debug, Clone)]
 struct Shared {
-    /// The region catalog by id.
+    /// The region catalog by id. A `HashMap`'s iteration order is
+    /// arbitrary, so what is served is [`ordered_catalog`]'s snapshot
+    /// of it, in id — registration — order.
     catalog: Arc<Mutex<HashMap<u32, RegionInfo>>>,
     /// Reader groups by group id.
     groups: Arc<Mutex<HashMap<u32, GroupEntry>>>,
@@ -190,6 +196,25 @@ struct Shared {
     /// buffer in a group's protection domain, kept alive until the
     /// provider is dropped.
     tuples: Arc<Mutex<HashMap<(u32, u32), rdma::MemoryRegion>>>,
+}
+
+/// The catalog snapshot in serving order: by id, the order the
+/// regions were registered in (ids are assigned sequentially at
+/// registration).
+///
+/// A `HashMap`'s iteration order is arbitrary — randomized per
+/// process — and the catalog is application-facing as a `Vec`, so its
+/// order is behavior, not an implementation detail: readers list and
+/// index it positionally, and registration order is the order they
+/// are promised. `Shared::catalog_and_tuples` serves this order, on
+/// every session exchange and every `Message::Update` re-request.
+pub(crate) fn ordered_catalog(catalog: &HashMap<u32, RegionInfo>) -> Vec<(u32, RegionInfo)> {
+    let mut entries: Vec<(u32, RegionInfo)> = catalog
+        .iter()
+        .map(|(&id, info)| (id, info.clone()))
+        .collect();
+    entries.sort_by_key(|&(id, _)| id);
+    entries
 }
 
 impl SharedMemoryRegionProvider {
@@ -255,9 +280,9 @@ impl SharedMemoryRegionProvider {
     /// over RDMA, which the service accepts into that group's
     /// protection domain — the group, and its domain, are created by
     /// the group's first reader. The reader then receives the region
-    /// catalog and the group's tuples, and may re-request them over
-    /// its open session at any time. Regions registered before or
-    /// after this call are served alike.
+    /// catalog (in registration order) and the group's tuples, and
+    /// may re-request them over its open session at any time. Regions
+    /// registered before or after this call are served alike.
     ///
     /// The service runs one rendezvous at a time; each open session
     /// then waits for its reader's requests on a thread of its own,
@@ -328,6 +353,10 @@ impl SharedMemoryRegionProvider {
     /// for [`Self::register`], from the byte address and size captured
     /// here, so the buffer is never touched by tuple creation.
     ///
+    /// The region is served in registration order: ids are assigned
+    /// sequentially at registration, and the catalog lists regions by
+    /// id.
+    ///
     /// # Panics
     ///
     /// Panics if `T` is zero-sized: such a region has no bytes to
@@ -388,6 +417,20 @@ impl SharedMemoryRegionProvider {
     /// borrow of the buffer while tuples are created and served.
     pub fn get_shared_mr(&self, id: u32, group: u32) -> io::Result<Option<(u64, usize, u32)>> {
         self.shared.tuple_of(id, group)
+    }
+
+    /// The two messages a session of `group` would be served — the
+    /// same pair every session exchange and `Message::Update`
+    /// re-request serves — without running one: the catalog, in
+    /// registration order, then the group's tuples.
+    ///
+    /// A crate-internal seam for the tests: the served order is a
+    /// library guarantee, and `src/tests/shared.rs` pins it without
+    /// hardware, through a provider whose groups have no connections
+    /// (so no tuple is created, no verbs path is touched).
+    #[cfg(test)]
+    pub(crate) fn served_exchange(&self, group: u32) -> (Message, Message) {
+        self.shared.catalog_and_tuples(group)
     }
 }
 
@@ -482,17 +525,12 @@ impl Shared {
 
     /// The catalog and the tuples of `group`, as the two messages of a
     /// session's exchange: every registered region, each with its
-    /// tuple for the group, created lazily here.
+    /// tuple for the group, created lazily here. The catalog is served
+    /// in registration order (by id — see [`ordered_catalog`]).
     fn catalog_and_tuples(&self, group: u32) -> (Message, Message) {
-        // A snapshot: the lock is released before tuple creation,
-        // which takes the same lock itself.
-        let catalog: Vec<(u32, RegionInfo)> = {
-            let locked = self.catalog.lock().unwrap();
-            locked
-                .iter()
-                .map(|(&id, info)| (id, info.clone()))
-                .collect()
-        };
+        // A snapshot in serving order: the lock is released before
+        // tuple creation, which takes the same lock itself.
+        let catalog = ordered_catalog(&self.catalog.lock().unwrap());
 
         let mut regions = Vec::with_capacity(catalog.len());
         let mut tuples = Vec::with_capacity(catalog.len());

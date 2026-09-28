@@ -1,7 +1,8 @@
 # RDMA-Lib
 
 Name is temporary. Lib is in development.
-Provides abstraction to RDMA primitives for Rust applications.
+
+Provides abstraction to RDMA primitives for Rust applications, with focus on disaggregated memory settings and one-sided operations.
 
 
 # Usage 

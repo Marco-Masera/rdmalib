@@ -17,7 +17,6 @@ struct Test {
 #[ignore = "cluster test: ./podman_build/link_test.sh --test read_test -- --ignored"]
 fn test_public_api() {
     let cluster = common::TestCluster::from_env();
-
     println!(
         "I am node {} of {}: {}",
         cluster.my_node,
@@ -35,11 +34,9 @@ fn test_public_api() {
 
     // Simple read/write test
     rdmalib::impl_remote_safe!(Test);
-    // Barrier across the deployed nodes: without it the readers race
-    // node0's serve() (nothing binds before it) and their TCP connect
-    // is refused. Node0 also has to outlive the readers' session, so
-    // it only tears the provider down after their second barrier.
+
     let mut synch = common::GlobalSynch::new(&cluster);
+
     if cluster.my_node == 0 {
         // Writer
         let owner =

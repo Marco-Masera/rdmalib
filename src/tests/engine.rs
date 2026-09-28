@@ -23,7 +23,6 @@ use crate::*;
 /// The fake's state, shared between the engine thread (submitting and
 /// polling, through the source) and the test (scripting completions,
 /// through its own clone of the arc).
-#[derive(Default)]
 struct FakeState {
     /// Every submit the source saw: `(wr_id, op, addr, len,
     /// remote_addr, rkey)`.
@@ -42,6 +41,10 @@ struct FakeState {
     polls: usize,
     /// arm() call count — the hybrid-block counter.
     arms: usize,
+    /// The fake connection's send-queue depth — the bound of
+    /// submissions. Defaulted to 16 (the old nominal depth), set
+    /// lower by the bound's tests.
+    depth: usize,
     /// Take this on the next submitted operation: its in-flight hold
     /// stamps the byte into the operation's buffer at finish — which
     /// is how a test tells the engine finished the hold before the
@@ -49,6 +52,26 @@ struct FakeState {
     stamp: Option<u8>,
     /// Every hold finish, as `(stamp, ok)`.
     finishes: Vec<(Option<u8>, bool)>,
+}
+
+impl Default for FakeState {
+    fn default() -> Self {
+        Self {
+            submitted: Vec::new(),
+            fail_submit: None,
+            script: VecDeque::new(),
+            auto: false,
+            in_flight: Vec::new(),
+            closed: false,
+            polls: 0,
+            arms: 0,
+            // The old nominal send-queue depth: enough for every
+            // test that does not exercise the bound.
+            depth: 16,
+            stamp: None,
+            finishes: Vec::new(),
+        }
+    }
 }
 
 impl FakeState {
@@ -122,6 +145,10 @@ fn register(engine: &Engine, conn: FakeConn, completions: FakeCompletions) -> u3
 }
 
 impl OpSource for FakeConn {
+    fn depth(&self) -> usize {
+        self.0.lock().unwrap().depth
+    }
+
     fn submit(
         &mut self,
         op: Op,
@@ -566,6 +593,103 @@ fn zero_length_operations_fail_at_submission() {
         .submit(conn, Op::Read, target(), Submitted::new(Vec::<u8>::new()))
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+    engine.shutdown();
+}
+
+#[test]
+fn submissions_past_a_connections_depth_fail_at_submission() {
+    // The send-queue bound, eager: with the fake's depth at 2, the
+    // third submission fails on the spot — the first two still run
+    // and complete, the queue pair never sees an over-deep post.
+    let engine = Engine::new();
+    let (conn_source, completions, state) = fake();
+    state.lock().unwrap().depth = 2;
+    state.lock().unwrap().auto = true;
+    let conn = register(&engine, conn_source, completions);
+
+    let (a, b) = (submit(&engine, conn, Op::Read), submit(&engine, conn, Op::Read));
+    let error = engine
+        .submit(conn, Op::Write, target(), Submitted::new(vec![0u8; 16]))
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("send queue is full"));
+    assert!(error.to_string().contains("max_send_wr is 2"));
+
+    assert_eq!(
+        (
+            expect_ok(block_on(a)).downcast::<Vec<u8>>().unwrap().len(),
+            expect_ok(block_on(b)).downcast::<Vec<u8>>().unwrap().len(),
+        ),
+        (16, 16)
+    );
+
+    engine.shutdown();
+}
+
+#[test]
+fn completions_free_the_send_queue_slots() {
+    // The bound follows completions, not submissions: depth 1 — the
+    // second submission fails while the first is in flight, passes
+    // again once the first completed.
+    let engine = Engine::new();
+    let (conn_source, completions, state) = fake();
+    state.lock().unwrap().depth = 1;
+    let conn = register(&engine, conn_source, completions);
+
+    let first = submit(&engine, conn, Op::Read);
+    let error = engine
+        .submit(conn, Op::Write, target(), Submitted::new(vec![0u8; 16]))
+        .unwrap_err();
+    assert!(error.to_string().contains("send queue is full"));
+
+    // The wr_id is taken under one lock at a time — a nested
+    // `state.lock()` inside the `complete` call's arguments would
+    // deadlock on the non-reentrant mutex.
+    wait_until(|| state.lock().unwrap().in_flight.len() == 1);
+    let wr_id = state.lock().unwrap().in_flight[0];
+    state.lock().unwrap().complete(wr_id, true, "");
+    assert_eq!(
+        expect_ok(block_on(first)).downcast::<Vec<u8>>().unwrap().len(),
+        16
+    );
+
+    // The completion freed the slot: the next submission passes.
+    let second = submit(&engine, conn, Op::Read);
+    wait_until(|| state.lock().unwrap().in_flight.len() == 1);
+    let wr_id = state.lock().unwrap().in_flight[0];
+    state.lock().unwrap().complete(wr_id, true, "");
+    assert_eq!(
+        expect_ok(block_on(second)).downcast::<Vec<u8>>().unwrap().len(),
+        16
+    );
+
+    engine.shutdown();
+}
+
+#[test]
+fn destroyed_connections_reject_submissions() {
+    // The eager end of the destroyed-connection path: once a
+    // destroyed connection is reaped (nothing of it left anywhere —
+    // the source itself is gone, provable by the arc's refcount),
+    // submissions to it fail on the spot instead of riding the
+    // mailbox into the engine's "gone or closing" error.
+    let engine = Engine::new();
+    let (conn_source, completions, state) = fake();
+    let conn = register(&engine, conn_source, completions);
+
+    engine.destroy(conn).unwrap();
+    // The reaped connection's source is gone: only the test's own
+    // handle and the engine's completion source still hold the
+    // state's arc (destroy tears the connection down, not the
+    // device's completion source).
+    wait_until(|| Arc::strong_count(&state) == 2);
+
+    let error = engine
+        .submit(conn, Op::Read, target(), Submitted::new(vec![0u8; 16]))
+        .unwrap_err();
+    assert!(error.to_string().contains(&format!("connection {conn} is gone")));
+    assert!(error.to_string().contains("destroyed"));
 
     engine.shutdown();
 }

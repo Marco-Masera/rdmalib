@@ -1,0 +1,10 @@
+[package]
+name = "rdmalib-benchmarks"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rdmalib = { path = ".." }
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = "7"
+futures = "0.3.34"

@@ -14,7 +14,11 @@
 //! - shared completion queues, via [`SharedCompletions`] and
 //!   [`Connection::connect_shared`]: one queue per (engine, device),
 //!   every connection of the device posting into it, so the
-//!   operations engine drains them all from one poll site;
+//!   operations engine drains them all from one poll site — with
+//!   the device's caps (`ibv_query_device`: `max_qp_wr`, `max_cqe`)
+//!   queried at its creation, every connection's send-queue depth
+//!   lent out of its completion budget under its sum rule (see
+//!   `docs/async_engine.md`);
 //!   and
 //! - the connection's pooled registration (private to
 //!   `Connection::submit`): one allocation, registered once, its
