@@ -14,10 +14,8 @@ const TCP_PORT: u16 = 9917;
 #[ignore = "needs an RDMA device"]
 fn reader_reads_what_the_owner_shares() {
     // Owner: share a region and start the metadata service.
-    let owner = SharedMemoryRegionProvider::new(SharedMemoryRegionProviderAddr::new(
-        RDMA_PORT,
-        TCP_PORT,
-    ));
+    let owner =
+        SharedMemoryRegionProvider::new(SharedMemoryRegionProviderAddr::new(RDMA_PORT, TCP_PORT));
     let handle = owner.register_typed("readings", vec![42u64, 43, 44]);
     owner.serve().unwrap();
 
@@ -69,13 +67,24 @@ fn reader_reads_what_the_owner_shares() {
         .unwrap();
     let late_region = reader.get_remote_mr(late_meta, Some(0)).unwrap();
     assert_eq!(
-        late_region.read_typed_async::<u32>(0, 2).unwrap().wait().unwrap(),
+        late_region
+            .read_typed_async::<u32>(0, 2)
+            .unwrap()
+            .wait()
+            .unwrap(),
         vec![7, 8]
     );
 
     // The owner keeps writing; the reader sees it.
     handle.borrow_mut()[1] = 99;
-    assert_eq!(region.read_typed_async::<u64>(1, 1).unwrap().wait().unwrap(), vec![99]);
+    assert_eq!(
+        region
+            .read_typed_async::<u64>(1, 1)
+            .unwrap()
+            .wait()
+            .unwrap(),
+        vec![99]
+    );
 }
 
 /// The write path of the same flow: the reader writes into the shared
@@ -88,10 +97,8 @@ fn reader_writes_what_the_owner_shares() {
     // its own, so this runs back-to-back with the read test above.
     const RDMA_PORT: u16 = 18516;
     const TCP_PORT: u16 = 9918;
-    let owner = SharedMemoryRegionProvider::new(SharedMemoryRegionProviderAddr::new(
-        RDMA_PORT,
-        TCP_PORT,
-    ));
+    let owner =
+        SharedMemoryRegionProvider::new(SharedMemoryRegionProviderAddr::new(RDMA_PORT, TCP_PORT));
     let handle = owner.register_typed("commands", vec![0u64, 0, 0, 0]);
     owner.serve().unwrap();
 
@@ -106,19 +113,28 @@ fn reader_writes_what_the_owner_shares() {
     let catalog = reader.get_remote_mr_metadata();
     let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
 
-    region.write_typed_async::<u64>(1, vec![7, 8]).unwrap().wait().unwrap();
+    region
+        .write_typed_async::<u64>(1, vec![7, 8])
+        .unwrap()
+        .wait()
+        .unwrap();
     // The owner sees the written elements...
     assert_eq!(&*handle.borrow(), &[0, 7, 8, 0]);
     // ...and so does the reader, reading them back.
     assert_eq!(
-        region.read_typed_async::<u64>(1, 2).unwrap().wait().unwrap(),
+        region
+            .read_typed_async::<u64>(1, 2)
+            .unwrap()
+            .wait()
+            .unwrap(),
         vec![7, 8]
     );
 
     // The byte view: a raw write of the first element's bytes.
     region
         .write_async(0, 13u64.to_ne_bytes().to_vec())
-        .unwrap().wait()
+        .unwrap()
+        .wait()
         .unwrap();
     assert_eq!(&*handle.borrow(), &[13, 7, 8, 0]);
     assert_eq!(

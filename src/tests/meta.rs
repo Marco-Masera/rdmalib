@@ -2,9 +2,7 @@ use std::io::{self, Cursor, ErrorKind};
 use std::net::TcpListener;
 use std::thread;
 
-use crate::meta::{
-    decode, read_frame, Channel, Message, RegionDesc, TupleDesc, PROTOCOL_VERSION,
-};
+use crate::meta::{Channel, Message, PROTOCOL_VERSION, RegionDesc, TupleDesc, decode, read_frame};
 
 fn round_trip(msg: Message) {
     let bytes = msg.encode();

@@ -121,7 +121,7 @@ fn zero_sized_elements_are_rejected() {
 
 #[test]
 fn the_served_catalog_is_sorted_by_id() {
-    use crate::providers::{ordered_catalog, RegionInfo};
+    use crate::providers::{RegionInfo, ordered_catalog};
     use std::collections::HashMap;
 
     // A catalog as scrambled as a `HashMap` can leave it: ids out of
@@ -143,7 +143,10 @@ fn the_served_catalog_is_sorted_by_id() {
     catalog.insert(0, info("a"));
     catalog.insert(5, info("f"));
     catalog.insert(1, info("b"));
-    let served: Vec<u32> = ordered_catalog(&catalog).iter().map(|&(id, _)| id).collect();
+    let served: Vec<u32> = ordered_catalog(&catalog)
+        .iter()
+        .map(|&(id, _)| id)
+        .collect();
     assert_eq!(served, [0, 1, 2, 5]);
 }
 

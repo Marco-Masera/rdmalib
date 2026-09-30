@@ -57,7 +57,11 @@ impl NodeInfo {
 
 impl fmt::Display for NodeInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} (tcp {}, rdma {})", self.ip, self.tcp_port, self.rdma_port)
+        write!(
+            f,
+            "{} (tcp {}, rdma {})",
+            self.ip, self.tcp_port, self.rdma_port
+        )
     }
 }
 
@@ -407,7 +411,11 @@ impl GlobalSynch {
 /// `my_clock` is the clock fixed for that round. The poller's clock is
 /// reported before the reply is sent, so a poller that has read a
 /// reply can rely on its target having already heard its own clock.
-fn answer(mut stream: TcpStream, my_clock: u64, seen: &mpsc::Sender<(IpAddr, u64)>) -> io::Result<()> {
+fn answer(
+    mut stream: TcpStream,
+    my_clock: u64,
+    seen: &mpsc::Sender<(IpAddr, u64)>,
+) -> io::Result<()> {
     stream.set_read_timeout(Some(SYNCH_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(SYNCH_IO_TIMEOUT))?;
     let mut request = [0u8; 8];
@@ -427,7 +435,10 @@ fn parses_the_runner_format() {
     assert_eq!(cluster.me().ip, "192.168.4.3");
     assert_eq!(cluster.me().tcp_port, 8101);
     assert_eq!(cluster.node(0).rdma_port, 9100);
-    assert_eq!(cluster.others().map(|n| n.index).collect::<Vec<_>>(), vec![0]);
+    assert_eq!(
+        cluster.others().map(|n| n.index).collect::<Vec<_>>(),
+        vec![0]
+    );
     assert_eq!(
         cluster.me().provider_addr(),
         SharedMemoryRegionProviderAddr::new(9101, 8101)

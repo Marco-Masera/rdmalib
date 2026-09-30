@@ -51,32 +51,21 @@ const MSG_TUPLES: u8 = 6;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Message {
     /// Reader → provider: greet, announcing a protocol version.
-    Hello {
-        version: u16,
-    },
+    Hello { version: u16 },
     /// Provider → reader: the greeting's reply, echoing the version
     /// the provider speaks.
-    Welcome {
-        version: u16,
-    },
+    Welcome { version: u16 },
     /// Reader → provider: join `group`, whose tuples the reader
     /// wants; the reader's RDMA connection follows immediately.
-    WantGroup {
-        group: u32,
-    },
+    WantGroup { group: u32 },
     /// Reader → provider: re-send the catalog and the session group's
     /// tuples.
     Update,
     /// Provider → reader: the region catalog, every registered
     /// region, in registration order (by id).
-    Metadata {
-        regions: Vec<RegionDesc>,
-    },
+    Metadata { regions: Vec<RegionDesc> },
     /// Provider → reader: the tuples of `group`, one per region.
-    Tuples {
-        group: u32,
-        tuples: Vec<TupleDesc>,
-    },
+    Tuples { group: u32, tuples: Vec<TupleDesc> },
 }
 
 /// A region as advertised in the catalog.
@@ -178,9 +167,7 @@ pub(crate) fn decode(ty: u8, payload: &[u8]) -> io::Result<Message> {
     };
     let msg = match ty {
         MSG_HELLO => Message::Hello { version: r.u16()? },
-        MSG_WELCOME => Message::Welcome {
-            version: r.u16()?,
-        },
+        MSG_WELCOME => Message::Welcome { version: r.u16()? },
         MSG_WANT_GROUP => Message::WantGroup { group: r.u32()? },
         MSG_UPDATE => Message::Update,
         MSG_METADATA => {

@@ -1,7 +1,7 @@
 # Async operations engine — design
 
 Status: agreed design; implementation in the step order below. Steps
-0–5 are done: the affinity FFI; the provider service-thread pinning;
+0–11 are done: the affinity FFI; the provider service-thread pinning;
 the wake channel (`pipe`/`poll(2)`); the engine itself (mailbox,
 slab, waker-driven op handles, idle blocking on the wake channel,
 drain-then-exit); the verbs `post`/`poll` split behind the seam
@@ -37,7 +37,14 @@ queried (`ibv_query_device`, once per device's shared queue —
 reject-with-the-numbers check at `update()` (the device's
 `max_qp_wr`, the shared queue's completion budget — the sum rule),
 and the eager submission bound (a submit past the connection's
-depth fails on the spot, with the numbers in the message).
+depth fails on the spot, with the numbers in the message); and the
+window gating every block — the busy window since the last progress
+(a command taken or a completion routed) defers the idle block on
+the wake channel too, not only the hybrid one, so a strict
+submit-and-wait loop finds the engine hot and pays no wake for it
+(the first benchmarks measured ~24 µs per sequential op: two
+block-and-wake cycles, the engine's and the waiter's); the default
+window raised to 256 µs accordingly.
 
 Goals and invariants not restated here live in `AGENTS.md`; this doc
 extends them with the operations path: one-sided reads and writes as
@@ -82,10 +89,12 @@ async operations, polled by one pinned, library-owned engine thread.
 5. **Engine is explicit and shareable.** `Engine::on_cpu(n)` (pinned) /
    `Engine::new()` (unpinned); passed to controller constructors. A
    `RemoteMemoryProvider` without an engine creates its own, unpinned.
-6. **Hybrid polling is mandatory.** A bounded busy-poll window while
-   work is pending (this is where the pinned-CPU latency win lives),
-   then fd-blocking when idle — otherwise every default engine would
-   burn a core.
+6. **Hybrid polling is mandatory.** A bounded busy-poll window after
+   the last progress — a command taken or a completion routed, work in
+   flight or not (this is where the pinned-CPU latency win lives, and
+   what keeps a sequential submit-and-wait loop off the wake channel)
+   — then fd-blocking — otherwise every default engine would burn a
+   core.
 7. **No engine-side timeouts.** Every posted WR completes (a torn-down
    connection flushes its outstanding WRs as error completions), so the
    current skip-stale-completions hack is deleted. Timeouts are user
@@ -225,9 +234,18 @@ let error = region.read_async(0, 4096).unwrap_err(); // "send queue is full: …
   across devices only — a single poll site in the common
   single-device case; bounded batch per source per sweep; process
   completions; sweep again.
-- While slots are pending: busy-poll within a bounded window
-  (configurable; the dedicated-core/HPC case can ask for pure busy).
-- Idle: hybrid fd-block —
+- Busy-poll within the window since the last progress (configurable;
+  the dedicated-core/HPC case can ask for pure busy) — operations in
+  flight or not: a submit that arrives while the engine spins finds
+  its command taken by the next sweep, so a sequential
+  submit-and-wait loop never pays a block-and-wake cycle.
+- The executor-less wait mirrors the same rule: `wait` spins within
+  the window before its first park — a fast operation then completes
+  with no park cycle at all — and a wake that lands during the spin
+  leaves an unpark token, so the spin-to-park transition cannot miss
+  one.
+- Window spent, nothing in flight: fd-block on the wake pipe alone.
+- Window spent, operations in flight: hybrid fd-block —
   1. arm every CQ (`ibv_req_notify_cq`) **before** blocking, or the
      engine sleeps on a completion it already holds;
   2. `poll(2)` on [wake-pipe read end, per-device comp-channel fds];
@@ -313,7 +331,9 @@ let op = region.write_typed_async(0, vec![42u64; 64])?;
 let returned = op.await?;
 
 // Without an executor: block on the op — `wait` is the join (the
-// engine thread still does the waiting work; this thread parks).
+// engine thread does the waiting work; this thread spins within the
+// busy window — a fast op completes with no park cycle — and parks
+// past it).
 let buffer = region.read_async(0, 4096)?.wait()?;
 ```
 
@@ -370,11 +390,267 @@ let buffer = region.read_async(0, 4096)?.wait()?;
    pool fully lent out, register directly. The seam holds: the
    engine's in-flight hold (`InFlight`, per operation) is finished
    — copy out, release — before the operation's buffer resolves.
-6. **(done)** The send-queue depth, its hardware caps, its knob, and
-   its eager submission bound (see "Send-queue depth, and its
-   bound" above): `ibv_query_device` per device
-   (`max_qp_wr`/`max_cqe`), `set_max_send_wr` (default 128),
-   reject-with-the-numbers at `update()`, the bound at submit.
+ 6. **(done)** The send-queue depth, its hardware caps, its knob, and
+    its eager submission bound (see "Send-queue depth, and its
+    bound" above): `ibv_query_device` per device
+    (`max_qp_wr`/`max_cqe`), `set_max_send_wr` (default 128),
+    reject-with-the-numbers at `update()`, the bound at submit.
+ 7. **(done)** The window gates idle blocking too: one knob
+    (`busy_window`) covers every block — the engine keeps sweeping
+    for the window after the last progress even with nothing in
+    flight, so a strict submit-then-wait loop (the first benchmarks
+    measured ~24 µs per sequential op: two block-and-wake cycles,
+    the engine's and the waiter's — the engine's half was the
+    idle block between ops) finds the engine hot and pays no wake
+    for it. `Duration::ZERO` keeps the old immediate-idle-block
+    behavior; `Duration::MAX` never blocks at all, idle or not. The
+    default raised to 256 µs — a round trip plus the gap between
+    sequential operations.
+ 8. **(done)** The waiter mirrors the engine's rule, and the spin
+     got cheap. `OpHandle::wait`/`RegionOp::wait`: the busy window
+     is the spin budget — within it the waiting thread spins (a
+     fast operation completes with no park cycle at all; the
+     park/unpark cycle is most of a blocking round trip's cost), a
+     wake during the spin leaves an unpark token, and past the
+     budget the thread parks as before; `Duration::MAX` never parks,
+     `Duration::ZERO` parks at once. The loop's iteration, the two
+     handoff granularities a sequential op pays, lost its
+     per-iteration rebuilds: the spin deadline is cached per progress
+     event (no per-iteration window lock or clock pair), the sweep's
+     completion batch is hoisted and reused, and the verbs poll's
+     work-completion scratch is uninitialized (the queue writes
+     `[0..ret]` fully) instead of a per-poll 1 KiB zeroing. Measured
+     on the first benchmark cluster (2008-era Xeon L5420 nodes,
+     engine and waiter pinned as L2 mates): sequential 8–64 B ops
+     ~24 µs → ~7 µs p50 (~6.5 µs min) park-default — `wait` and the
+     spin-wait floor converge; the remaining ~4 µs over same-thread
+     perftest (~3 µs) is the engine-thread architecture on that
+     hardware (two handoffs + submit-side work), with an
+     environment tail (~+11 µs on ~10–35% of spin-burned samples:
+     the descheduler, not the library — a parked waiter does not
+     pay it).
+ 9. **(done)** The hot paths are lockless, allocation-free, and —
+     proven by syscall counting — run entirely in user space while
+     both threads are within their busy windows. The audit that
+     followed the step-8 numbers (a fixed ~5 µs of per-op cost over
+     the wire on newer nodes) itemized what a sequential
+     submit-and-wait still paid: a slab mutex pair and a waker
+     clone *per spin iteration* of `wait`'s poll loop (which also
+     contended the very lock the engine resolves under), a
+     `mem::take` of the mailbox queue that freed its buffer every
+     drain and re-malloc'd it on the next push (an allocation pair
+     per batch), a fresh `Arc<Thread>` waker per `wait` (another
+     pair per operation), and one clock read per engine iteration.
+     The fixes, in the same order: the slot carries a `done` flag —
+     an `Arc<AtomicBool>`, one allocation per *slot* not per
+     operation, cloned into the handle at submission (the handle
+     cannot index into the slab's `Vec`, which a concurrent
+     submission's push can reallocate — the `Arc`'s allocation is
+     stable), reset at allocation and set at resolution — and
+     `wait` spins on that one acquire load (the clock checked once
+     per sixty-four spins), taking the lock only for the single
+     final poll, which no resolution can race: the check and the
+     waker registration share the engine's critical section; the
+     mailbox drains by swapping with a hoisted scratch queue (both
+     sides keep their allocations), behind a `pending` flag set
+     under the lock by every push and cleared by the drain — so an
+     idle iteration is one load, not a mutex pair; the waker is
+     cached per thread (one `Arc<Thread>` per thread, refcounts
+     thereafter). Measured: sequential 8–64 B ops on the L5420 pair
+     ~7 µs → **~6.1–6.3 µs p50 with mean ≈ p90** (the environment
+     tail vanished — the spin-poll's lock churn was what attracted
+     the descheduler); 16-op concurrent groups 43.9 → 39.9 µs
+     (read) and 37.0 → 33.3 µs (write) — sixteen waiters no longer
+      hammer the slab; `strace -c` over a 3200-op run counts 50
+      `write`s, 5 `futex`es — all startup, shutdown, and logging:
+      **zero syscalls per operation**. The machinery alone: ~1.5 µs
+      p50 on a modern dev machine by the fake-source diagnostic
+      (`machinery_round_trip_floor`), and 1.4–1.8 µs by the
+      operation timeline on the real path (step 10) — CPU-bound and
+      clock-scaled, as designed. What is left for the follow-on
+      (the registered buffers below, then a lock-free submit/resolve
+      path if needed): the type-erased `Box<dyn Any>` per operation
+      and the pooled slice's lend/return mutex pairs — the last
+       allocation pair and the last three lock pairs a sequential
+       operation pays.
+ 10. **(done)** The engine's own clock thinned, the operation
+     timeline made visible — and the "verbs-path residual" it
+     revealed dissolved into a measurement artifact. The run loop's
+     window check had read the clock every iteration (a vDSO round
+     trip against each iteration's single load and poll): thinned
+     to once per sixteen, the L5420 pair's sequential reads dropped
+     6.3 → **5.9 µs p50** from that alone. The timeline trace
+     (`RDMALIB_OP_TRACE=1`, `Engine::with_op_trace`): five stamps
+     per operation — submitted, post entered, post left, completion
+     resolved, waiter done — each written under the slab lock the
+     stamper's path already holds, recorded by the waiter's final
+     poll outside it, printed at shutdown as percentiles of the
+     four segments. L5420 pair: submit→post 0.52 µs, post 0.49 µs,
+     wire 3.8 µs, complete→done 0.81 µs. EPYC pair (Broadcom 10G
+     RoCE, governor-throttled): submit→post 0.34 µs, post 0.65 µs,
+     wire 18.8 µs, complete→done 0.41 µs — machinery 1.4 µs against
+     perftest's self-reported 10.7 µs at 64 B, an apparent ~8 µs
+     residual that inline data, a channel-less CQ, and an
+     empty-poll probe (30 ns) each failed to explain. The
+     explanation was perftest itself: it converts cycles to µs
+     with the wrong rate — on that pair a frequency it detects as
+     conflicting ("Conflicting CPU frequency values detected …
+     CPU Frequency is not max", printed every iteration), and
+     run-difference wall-clock (100 000 iterations minus 5 000)
+     gives **21.6 µs per perftest op, not 10.7**. Our sequential
+     op there is 20.8 µs p50 — under single-thread parity,
+     machinery 1.4 µs. The same check on the L5420 pair (fixed
+     clocks, no warning printed — perftest stays silent there)
+     found it mis-scaled there too: self-reported 2.28 µs at 64 B,
+     run-difference real **4.63 µs** (0.920 s at 100 000 minus
+     0.480 s at 5 000). Our own numbers are honest: an
+     external-clock difference (1.1 M iterations against 10 000,
+     timed from another machine) gives 5.9 ± 0.3 µs real against
+     the 6.32 µs our CLOCK_MONOTONIC histogram reports. The
+      verdict: our 64 B sequential write there is 6.32 µs — the
+      real baseline 4.63 plus **1.7 µs of machinery**, exactly the
+      traced segments (0.52 + 0.63 + 0.65), the wire window at
+      parity (our post→complete 4.17 against perftest's real
+      loop minus its post); the EPYC pair under parity outright.
+      The fixed cost above the wire is the machinery — 1.4–1.8 µs
+      at these clocks — and no perftest self-reported µs is a
+      baseline anywhere: run-difference wall-clock, or the
+      timeline trace, every time.
+
+ 11. **(done)** Registered buffers — the zero-copy operation path
+      (the section below): `RBuf<T>` handles
+      (`RemoteMemoryProvider::register_buffer`), operations by
+      mutable borrow (`read_into_rbuf`/`write_rbuf`), the engine's
+      registered-op plumbing (`submit_registered` posts against the
+      registration directly — no pool slice, no hold, no
+      `Box<dyn Any>` on the operation's path; registrations and
+      deregistrations are mailbox commands, the deregistration
+      carrying the handed-over memory to the engine thread, an
+      `EBUSY` verbs-side parked until a later submit drains it).
+      Measured on the first cluster at 64 B: write 6.40 → **5.92
+      µs p50**, read 6.14 → **5.76 µs p50** — ~0.4–0.5 µs, the
+      pool's copy and the buffer's move through the slot gone.
+
+## Registered buffers (step 11)
+
+The measured follow-on to the pool (the last of the open questions
+below): a user-facing registered-buffer API — the old C++ library's
+zero-copy model, brought to the engine's threading rules. Done: the
+`RBuf` handle, the reader-side API, the engine's
+registered-operation plumbing, tests, and the benchmarks' zero-copy
+singles.
+
+- `RBuf<T>`: a buffer the user owns and the engine registers, once,
+  in the group's connection domain — created by
+  `RemoteMemoryProvider::register_buffer(group, vec)` (a blocking
+  round-trip through the mailbox: every verbs call stays on the
+  engine thread, per the design's invariant). The handle keeps the
+  registration alive until dropped; the drop deregisters through
+  the mailbox, handing the buffer's memory back — a deregistration
+  queued behind in-flight operations of the connection lands after
+  them (the mailbox is FIFO), and a registration verbs-side busy
+  (`EBUSY` — an operation still on the wire) parks until a later
+  submit drains it, so the memory hands over with nothing of itself
+  in flight.
+- Operations take it by mutable borrow: `read_into_rbuf(offset, &mut
+  rbuf)` / `write_rbuf(offset, &mut rbuf)` — no allocation, no
+  type-erasure boxing, no pool copy; the engine posts directly
+  against the registration (`submit_registered`: the covering
+  lookup over the connection's registrations — disjoint live
+  allocations make it unambiguous), and the slot holds only the
+  wr_id (no `InFlight` hold: the registration outlives the
+  operation). The future (`RBufOp`) keeps the buffer's exclusive
+  borrow and resolves with nothing back; dropping it abandons the
+  operation — the device may touch the memory until the completion,
+  so keep the future alive (or await a later operation on the same
+  group) before reusing a dropped operation's buffer.
+- The wins, measured on the first cluster at 64 B (the zero-copy
+  counterparts of the owned-path singles, same nodes, same payload):
+  write **6.40 → 5.92 µs p50**, read **6.14 → 5.76 µs p50** —
+  ~0.4–0.5 µs, the pool's copy, its lend/borrow, and the buffer's
+  move through the slot gone; larger reused buffers save the copy
+  in proportion. What it does not remove: the two engine-thread
+  handoffs (submit → post, completion → wake) — the sequential
+  small-op floor stays the engine-thread architecture's (~5.9 µs
+  p50 on these nodes, of which machinery ~1.4 µs over perftest's
+  real wall-clock there — 4.63 µs at 64 B — while the EPYC pair
+  measured under parity outright; step 10). Same-thread posting —
+  perftest's model — would break the `!Sync` verbs stance and the
+  one-poller design, and is not planned.
+- Testing: the registration commands through the mailbox (inner,
+  against the fakes — a registered operation posts the registered
+  address and resolves with nothing; a deregistration lands after
+  the operations queued before it), the reader-side path end to
+  end against the fakes (register, read into, write from, the
+  group-mismatch rejection, the drop's deregistration), and the
+  benchmarks' `single_{read,write}_rbuf` for the real half.
+
+## Tuning for latency
+
+The engine's own costs are small and user-space-only (steps 9
+and 10),
+but they sit *on top of* whatever the machine is doing — placement,
+clocks, and interrupts decide most of the per-op cost above the wire.
+The rules, in order of measured impact:
+
+- **Pin the engine and the waiting thread together, to cores that
+  share an L2/LLC.** The two threads hand off twice per operation
+  (submit → post, completion → wake) and share the mailbox and slab
+  locks across every handoff; on every architecture measured, a lock
+  line that stays inside one cache translates in tens of
+  nanoseconds, one that crosses a socket costs microseconds. The
+  library pins the engine (`Engine::on_cpu`); the waiting thread is
+  pinned by the caller (the benchmarks expose `--engine-cpu`/
+  `--client-cpu`, defaulting to the first cluster's placement — find
+  the machine's own with its topology: `lscpu` for siblings and
+  NUMA, `/proc/interrupts` for where the NIC's completion vectors
+  land). Keep *both* off the NIC's completion-interrupt cores — an
+  ISR stealing the engine's core mid-poll costs more than any cache
+  crossing. Measured on the first cluster: same-L2 beat a private
+  core by ~2.7 µs/op; on the EPYC pair the same-CCX default was the
+  best of the placements tried.
+- **Fix the CPU frequency — twice over.** A node whose governor
+  parks its cores at base frequency pays ~2× on every CPU-side
+  cost — the machinery is CPU-bound (the fake-measured floor of
+  step 9: ~1.5 µs p50 at modern clocks; ~2× at half the clocks),
+  and a frequency-scaled node also breaks perftest's own µs
+  (it warns — "Conflicting CPU frequency values detected", every
+  iteration — and under-reported the EPYC pair's wire latency by
+  ~2×: 10.7 self-reported vs 21.6 measured). **Take every baseline
+  by wall-clock difference (a long run minus a short one), never
+  by perftest's self-reported µs, anywhere:** the fixed-clock
+  L5420 pair, with no warning printed, was mis-scaled the same
+  ~2× (2.28 self-reported vs 4.63 measured). Our own numbers are
+  CLOCK_MONOTONIC and verified honest against an external clock
+  (5.9 ± 0.3 µs real vs 6.32 reported). `cpupower
+  frequency-set -g performance` (root) fixes the real cost; no
+  library change can.
+- **Prefer the hybrid `wait` (the default) to pure spin.** The busy
+  window is the spin budget: within it a wait spins (no park cycle),
+  past it the thread parks. Pure spinning (`busy_window =
+  MAX` or the benchmarks' `--wait spin`) is the floor on a
+  *dedicated, isolated* core only — on a general-purpose core the
+  descheduler eventually preempts the spinner and the +11 µs tail
+  appears; the parked waiter never pays it, so the hybrid mode's
+  mean tracks its p50. Isolated cores (`isolcpus`, `nohz_full`) are
+  the environment's half of making pure spin honest.
+- **Trust the defaults otherwise**: the 256 µs busy window covers a
+  round trip plus the gap between sequential operations, and the
+  send-queue depth bound keeps submission eager. Both are knobs the
+  benchmark matrix exercises (`with_busy_window`,
+  `set_max_send_wr`), not values to tune per machine.
+
+The diagnostic for all of the above: the benchmarks' latency
+histograms (mean drifting above p50 = a preemption/environment tail,
+not library cost; mean ≈ p90 = the machine is quiet); the operation
+timeline (`RDMALIB_OP_TRACE=1` on any benchmark) splitting each op
+into mailbox hop, verbs post, wire, and wake — the wire segment
+against a wall-clock-difference baseline is the whole truth about
+the environment; and the engine's own floor without the wire — the
+`machinery_round_trip_floor` test (ignored: run it scoped to the
+library binary, never with the cluster-test deploy flags) reporting
+what submit → handoff → post → resolve → wake costs on that
+machine's clocks, against the fake source.
 
 ## Open questions
 
@@ -399,7 +675,9 @@ let buffer = region.read_async(0, 4096)?.wait()?;
   copy-vs-registration crossover, per device, is measurable; knobs
   to expose once someone measures. Two known follow-on wins: inline
   data for tiny writes (no local registration nor pool slice at
-  all), and a user-facing registered-buffer API (zero-copy, the
-  old C++ library's model) for large reused buffers.
+  all), and a user-facing registered-buffer (zero-copy) API for
+  large reused buffers — the latter done (step 11; the registered
+  path skips the pool entirely, so the crossover only matters for
+  callers that keep using the owned-buffer API).
 - A `Send` reader-side redesign (multi-thread submission) — only if
   user demand appears.

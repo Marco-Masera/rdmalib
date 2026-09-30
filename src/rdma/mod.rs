@@ -57,7 +57,7 @@
 //! // high-level reader side wires this; in practice the tuple
 //! // travels over the metadata channel, and the operations are
 //! // `RemoteMemoryRegion`'s async reads and writes).
-//! let conn = Connection::connect("10.0.0.1:18515").unwrap();
+//! let conn = Connection::connect("10.0.0.1:18515", 128).unwrap();
 //! ```
 
 mod verbs;

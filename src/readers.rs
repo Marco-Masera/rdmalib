@@ -35,8 +35,8 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-use crate::engine::{CompletionSource, Op, OpHandle, OpTarget, Submitted};
-use crate::meta::{Channel, Message, TupleDesc, PROTOCOL_VERSION};
+use crate::engine::{CompletionSource, ConnRef, Op, OpHandle, OpTarget, Outcome, Submitted};
+use crate::meta::{Channel, Message, PROTOCOL_VERSION, TupleDesc};
 use crate::pod::zeroed_vec;
 use crate::rdma;
 use crate::{Engine, RemoteSafe};
@@ -125,9 +125,10 @@ pub(crate) struct GroupConnection {
     /// The engine the group's connection is registered with — the
     /// provider's, whatever it was built with.
     pub(crate) engine: Engine,
-    /// The connection id the engine assigned; absent with no
-    /// session.
-    pub(crate) conn: Option<u32>,
+    /// The group's engine-registered connection — the ticket its
+    /// operations ride with and bound against (see
+    /// `engine::ConnRef`); absent with no session.
+    pub(crate) conn: Option<ConnRef>,
 }
 
 impl GroupConnection {
@@ -135,17 +136,16 @@ impl GroupConnection {
     /// — a successful [`RemoteMemoryProvider::update`] of the group
     /// is needed first.
     pub(crate) fn empty(engine: Engine) -> Self {
-        Self {
-            engine,
-            conn: None,
-        }
+        Self { engine, conn: None }
     }
 
-    /// The group's engine-registered connection id, or an error
+    /// The group's engine-registered connection, or an error
     /// explaining why there is none.
-    pub(crate) fn get(&self) -> io::Result<u32> {
-        self.conn.ok_or_else(|| {
-            io::Error::other("the group has no RDMA connection: a successful update is required first")
+    pub(crate) fn get(&self) -> io::Result<&ConnRef> {
+        self.conn.as_ref().ok_or_else(|| {
+            io::Error::other(
+                "the group has no RDMA connection: a successful update is required first",
+            )
         })
     }
 }
@@ -357,16 +357,100 @@ impl RemoteMemoryRegion {
     /// # let region = provider.get_remote_mr(&catalog[0], Some(0)).unwrap();
     /// // Submit at most this many before awaiting some:
     /// let ops: Vec<_> = (0..region.max_in_flight())
-    ///     .map(|i| region.read_async(i * 4096, 4096))
+    ///     .map(|i| region.read_async(i as u64 * 4096, 4096))
     ///     .collect::<std::io::Result<Vec<_>>>()
     ///     .unwrap();
     /// ```
     pub fn max_in_flight(&self) -> usize {
         let connection = self.connection.borrow();
-        match connection.conn {
-            Some(conn) => connection.engine.in_flight_limit(conn).unwrap_or(0),
-            None => 0,
+        match connection.conn.as_ref() {
+            // The ticket carries its connection's bound: the depth,
+            // while the connection lives — 0 once it is torn down.
+            Some(conn) if conn.is_live() => conn.depth() as usize,
+            _ => 0,
         }
+    }
+
+    /// Read the whole of `rbuf`'s worth of bytes starting at byte
+    /// `offset` from the remote region, into the registered buffer
+    /// directly — the zero-copy read (see [`RBuf`]): the device
+    /// writes the registered memory, so no copy, no pooled slice, no
+    /// per-operation registration runs on the operation's path.
+    ///
+    /// The read must stay within the region, and the region must
+    /// belong to the buffer's group (the registration lives in that
+    /// group's connection domain). The returned future holds the
+    /// buffer's exclusive borrow; the borrow ends with the future,
+    /// the data in place (see [`RBuf::as_slice`]).
+    pub fn read_into_rbuf<T: RemoteSafe>(
+        &self,
+        offset: u64,
+        rbuf: &mut RBuf<T>,
+    ) -> io::Result<RBufOp<'_, T>> {
+        self.post_registered_op(Op::Read, offset, rbuf)
+    }
+
+    /// Write the whole of `rbuf`'s bytes to the remote region
+    /// starting at byte `offset`, from the registered buffer
+    /// directly — the zero-copy write (see [`RBuf`]): the device
+    /// reads the registered memory, so no copy runs on the
+    /// operation's path.
+    ///
+    /// The same bounds and group rules as
+    /// [`Self::read_into_rbuf`], and the same borrow semantics.
+    pub fn write_rbuf<T: RemoteSafe>(
+        &self,
+        offset: u64,
+        rbuf: &mut RBuf<T>,
+    ) -> io::Result<RBufOp<'_, T>> {
+        self.post_registered_op(Op::Write, offset, rbuf)
+    }
+
+    /// The registered-buffer operations' common half: the bounds and
+    /// group checks, then the eager engine submission, from this
+    /// thread — the future keeps the buffer's exclusive borrow.
+    fn post_registered_op<T: RemoteSafe>(
+        &self,
+        op: Op,
+        offset: u64,
+        rbuf: &mut RBuf<T>,
+    ) -> io::Result<RBufOp<'_, T>> {
+        let len = rbuf.size;
+        if offset.saturating_add(len as u64) > self.size as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} of {} bytes at offset {offset} exceeds the region of {} bytes",
+                    op.name(),
+                    len,
+                    self.size
+                ),
+            ));
+        }
+        if rbuf.group != self.group {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the buffer is registered with group {}, the region is in group {} — the buffer's registration is not visible to the region's connection",
+                    rbuf.group, self.group
+                ),
+            ));
+        }
+        let slot = self.connection.borrow();
+        let handle = slot.engine.submit_registered(
+            slot.get()?,
+            op,
+            OpTarget {
+                remote_addr: self.remote_addr + offset,
+                rkey: self.rkey,
+            },
+            rbuf.addr,
+            len,
+        )?;
+        Ok(RBufOp {
+            handle,
+            buffer: PhantomData,
+        })
     }
 
     /// The bounds and layout checks ran in the callers; what is left
@@ -441,7 +525,7 @@ impl RemoteMemoryRegion {
                 type_name::<T>(),
                 size_of::<T>(),
                 align_of::<T>()
-            )
+            ),
         ))
     }
 }
@@ -475,7 +559,7 @@ impl<T: RemoteSafe> Future for RegionOp<T> {
         // RegionOp is Unpin (its handle is), so the pin never holds.
         let this = self.get_mut();
         match Future::poll(Pin::new(&mut this.handle), cx) {
-            Poll::Ready(Ok(buffer)) => match buffer.downcast::<Vec<T>>() {
+            Poll::Ready(Ok(Outcome::Buffer(buffer))) => match buffer.downcast::<Vec<T>>() {
                 Ok(buffer) => Poll::Ready(Ok(*buffer)),
                 // Unreachable by construction: the buffer was erased
                 // from a `Vec<T>` at submission.
@@ -483,6 +567,11 @@ impl<T: RemoteSafe> Future for RegionOp<T> {
                     "the engine returned a buffer of the wrong element type — an engine bug",
                 ))),
             },
+            // Unreachable by construction: an owned operation resolves
+            // with its buffer.
+            Poll::Ready(Ok(Outcome::Unit)) => Poll::Ready(Err(io::Error::other(
+                "the engine resolved an owned operation without its buffer — an engine bug",
+            ))),
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
             Poll::Pending => Poll::Pending,
         }
@@ -491,17 +580,160 @@ impl<T: RemoteSafe> Future for RegionOp<T> {
 
 impl<T: RemoteSafe> RegionOp<T> {
     /// Block until the operation resolves — the join for callers
-    /// without an executor (with one, await instead). The engine
-    /// thread does the waiting work; this thread parks until the
-    /// engine's wake. Operations waited in turn still overlap: they
-    /// complete concurrently, on the engine thread.
+    /// without an executor (with one, await instead). Hybrid, like
+    /// the engine's own loop: within the busy window this thread
+    /// spins (a fast operation completes with no park cycle at
+    /// all), past it it parks until the engine's wake. Operations
+    /// waited in turn still overlap: they complete concurrently, on
+    /// the engine thread.
     pub fn wait(self) -> io::Result<Vec<T>> {
         let buffer = self.handle.wait()?;
-        match buffer.downcast::<Vec<T>>() {
-            Ok(buffer) => Ok(*buffer),
+        match buffer {
+            Outcome::Buffer(buffer) => match buffer.downcast::<Vec<T>>() {
+                Ok(buffer) => Ok(*buffer),
+                // Unreachable by construction — see the future's poll.
+                Err(_) => Err(io::Error::other(
+                    "the engine returned a buffer of the wrong element type — an engine bug",
+                )),
+            },
             // Unreachable by construction — see the future's poll.
-            Err(_) => Err(io::Error::other(
-                "the engine returned a buffer of the wrong element type — an engine bug",
+            Outcome::Unit => Err(io::Error::other(
+                "the engine resolved an owned operation without its buffer — an engine bug",
+            )),
+        }
+    }
+}
+
+/// A registered buffer: the reader's own memory, registered once
+/// with a group's connection domain, that operations post against
+/// directly — no copy through the engine's pool, no per-operation
+/// registration, nothing held in flight. The zero-copy end of the
+/// reader API (see [`RemoteMemoryProvider::register_buffer`]).
+///
+/// The buffer is owned here, and lent to operations as a mutable
+/// borrow: while an operation's future is alive the borrow checker
+/// keeps every other access out; the borrow ends when the future
+/// resolves (or is dropped), and the data is in place — [`Self::
+/// as_slice`] reads it. Dropping an operation before it resolves
+/// abandons it — the engine completes it anyway, with the device
+/// free to touch the memory until then: keep the future alive, or
+/// await a later operation on the same group before touching a
+/// buffer whose operation was dropped.
+///
+/// Not `Send`: it borrows the group's reader-side state, like every
+/// reader-side handle.
+pub struct RBuf<T: RemoteSafe = u8> {
+    /// The group's connection slot — the registration and its
+    /// deregistration ride it, and so do the buffer's operations.
+    connection: Rc<RefCell<GroupConnection>>,
+    /// The registered buffer itself: the bytes the device touches.
+    /// Never resized or reallocated while registered — its heap is
+    /// what the registration pins, captured at registration.
+    buffer: Vec<T>,
+    /// The registered range's address and size, captured at
+    /// registration (the buffer's data pointer and byte length).
+    addr: u64,
+    size: usize,
+    /// The group the registration belongs to: operations through a
+    /// region of another group would post on another connection,
+    /// which cannot see this registration — rejected eagerly.
+    group: u32,
+}
+
+impl<T: RemoteSafe> RBuf<T> {
+    /// The buffer's contents. In place after a read operation
+    /// resolved; what a write operation sent.
+    pub fn as_slice(&self) -> &[T] {
+        &self.buffer
+    }
+
+    /// The buffer's contents, mutably — between operations only
+    /// (an in-flight operation holds the exclusive borrow).
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.buffer
+    }
+
+    /// The buffer's length, in elements.
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Whether the buffer is empty (an empty buffer cannot be
+    /// registered, so this is always false while it is registered).
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+}
+
+impl<T: RemoteSafe> Drop for RBuf<T> {
+    fn drop(&mut self) {
+        // Deregister, handing the memory over: the engine thread
+        // releases it only once the device is done with it (an
+        // in-flight operation's `EBUSY` holds it until a later
+        // attempt frees it), and a dead engine — one whose teardown
+        // already flushed every operation — may simply refuse, with
+        // nothing left to protect the memory from.
+        let slot = self.connection.borrow();
+        let conn = slot.get();
+        if let Ok(conn) = conn {
+            let _ = slot.engine.deregister_buffer(
+                conn,
+                self.addr,
+                self.size,
+                Box::new(std::mem::take(&mut self.buffer)),
+            );
+        }
+        // A session-less slot (`conn` errored) never registered the
+        // buffer either — nothing to deregister.
+    }
+}
+
+/// The future of one registered-buffer operation (see
+/// [`RemoteMemoryRegion::read_into_rbuf`]): it resolves with `()` —
+/// the buffer stays where it is, its borrow ending with the future.
+///
+/// Not `Send` (it borrows the buffer), so it is awaited where it was
+/// submitted — or with [`Self::wait`], without an executor. Dropping
+/// it before resolution abandons the operation, the device free to
+/// touch the buffer until the completion (see [`RBuf`]).
+pub struct RBufOp<'a, T: RemoteSafe = u8> {
+    /// The engine-level operation future.
+    handle: OpHandle,
+    /// The borrowed buffer — the exclusive borrow that ends with
+    /// this future.
+    buffer: PhantomData<&'a mut RBuf<T>>,
+}
+
+impl<T: RemoteSafe> Future for RBufOp<'_, T> {
+    type Output = io::Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // RBufOp is Unpin (its handle is), so the pin never holds.
+        let this = self.get_mut();
+        match Future::poll(Pin::new(&mut this.handle), cx) {
+            Poll::Ready(Ok(Outcome::Unit)) => Poll::Ready(Ok(())),
+            // Unreachable by construction: a registered-buffer
+            // operation parks nothing, so nothing comes back.
+            Poll::Ready(Ok(Outcome::Buffer(_))) => Poll::Ready(Err(io::Error::other(
+                "the engine resolved a registered-buffer operation with a buffer — an engine bug",
+            ))),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T: RemoteSafe> RBufOp<'_, T> {
+    /// Block until the operation resolves — the join for callers
+    /// without an executor (with one, await instead). Hybrid, like
+    /// the engine's own loop: within the busy window this thread
+    /// spins, past it it parks until the engine's wake.
+    pub fn wait(self) -> io::Result<()> {
+        match self.handle.wait()? {
+            Outcome::Unit => Ok(()),
+            // Unreachable by construction — see the future's poll.
+            Outcome::Buffer(_) => Err(io::Error::other(
+                "the engine resolved a registered-buffer operation with a buffer — an engine bug",
             )),
         }
     }
@@ -573,7 +805,11 @@ impl RemoteMemoryProvider {
     /// devices this provider's sessions landed on. `None` before any
     /// session ran.
     pub fn device_max_qp_wr(&self) -> Option<u32> {
-        self.completions.borrow().iter().map(|sc| sc.max_qp_wr()).min()
+        self.completions
+            .borrow()
+            .iter()
+            .map(|sc| sc.max_qp_wr())
+            .min()
     }
 
     /// Metadata of the remote memory regions known to this provider,
@@ -600,6 +836,57 @@ impl RemoteMemoryProvider {
     /// picking up regions the remote registered since; if that
     /// exchange fails, the channel is dropped and the next call runs
     /// a fresh session.
+    /// Register `buffer` with the group's connection domain, returning
+    /// it as a [`RBuf`] — the zero-copy end of the operations API (see
+    /// [`RemoteMemoryRegion::read_into_rbuf`]).
+    ///
+    /// The buffer is registered once, with everything the group's
+    /// operations need, and never copied through it again; its heap
+    /// must not move from here on, which the returned handle's
+    /// ownership guarantees (the `Vec` is held, not grown). `T` is
+    /// the element type the buffer is read into and written from,
+    /// under [`RemoteSafe`]'s every-bit-pattern rule.
+    ///
+    /// A session for the group must have run (a successful
+    /// [`Self::update`]): the registration happens on the engine
+    /// thread, through the group's connection.
+    pub fn register_buffer<T: RemoteSafe>(
+        &self,
+        group: u32,
+        buffer: Vec<T>,
+    ) -> io::Result<RBuf<T>> {
+        if buffer.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot register an empty buffer",
+            ));
+        }
+        let session = self
+            .sessions
+            .borrow()
+            .get(&group)
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "group {group} has no session: a successful update is required first"
+                ))
+            })?
+            .connection
+            .clone();
+        let slot = session.borrow();
+        let conn = slot.get()?;
+        let addr = buffer.as_ptr() as u64;
+        let size = buffer.len() * size_of::<T>();
+        slot.engine.register_buffer(conn, addr, size)?;
+        drop(slot);
+        Ok(RBuf {
+            connection: session,
+            buffer,
+            addr,
+            size,
+            group,
+        })
+    }
+
     pub fn update(&self, group: u32) -> io::Result<()> {
         let mut sessions = self.sessions.borrow_mut();
         let session = sessions.entry(group).or_insert_with(|| GroupSession {
@@ -667,7 +954,7 @@ impl RemoteMemoryProvider {
             {
                 let mut slot = session.connection.borrow_mut();
                 if let Some(old) = slot.conn.replace(conn) {
-                    self.engine.destroy(old)?;
+                    self.engine.destroy(&old)?;
                 }
             }
 
@@ -702,9 +989,7 @@ impl RemoteMemoryProvider {
             .borrow()
             .get(&cached.group)
             .map(|session| Rc::clone(&session.connection))
-            .unwrap_or_else(|| {
-                Rc::new(RefCell::new(GroupConnection::empty(self.engine.clone())))
-            });
+            .unwrap_or_else(|| Rc::new(RefCell::new(GroupConnection::empty(self.engine.clone()))));
         Some(RemoteMemoryRegion {
             connection,
             remote_addr: cached.remote_addr,
@@ -719,7 +1004,13 @@ impl RemoteMemoryProvider {
 
     /// Fill the caches from the exchange of `group`'s session.
     fn ingest(&self, group: u32, exchange: (Message, Message)) -> io::Result<()> {
-        let (Message::Metadata { regions }, Message::Tuples { group: served, tuples }) = exchange
+        let (
+            Message::Metadata { regions },
+            Message::Tuples {
+                group: served,
+                tuples,
+            },
+        ) = exchange
         else {
             return Err(io::Error::other(
                 "the remote replied with something other than the catalog and the tuples",
@@ -751,9 +1042,7 @@ impl RemoteMemoryProvider {
             .collect();
         let mut active = self.regions.borrow_mut();
         for region in &regions {
-            let entry = active
-                .entry((region.name.clone(), region.id))
-                .or_default();
+            let entry = active.entry((region.name.clone(), region.id)).or_default();
             entry.retain(|cached| cached.group != group);
             if let Some(tuple) = tuples_by_id.get(&region.id) {
                 entry.push(CachedRegion {

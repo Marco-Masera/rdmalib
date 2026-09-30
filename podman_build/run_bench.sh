@@ -113,10 +113,11 @@ for bench in "${benchmarks[@]}"; do
   fi
 
   echo "[run_bench] Launching benchmark '$bench' on cluster..."
-  python3 "$root/scripts/bench_runner.py" \
-      "$bin_path" \
-      --profile "$profile" \
-      -- "${forward_args[@]}" || status=1
+  runner_cmd=(python3 "$root/scripts/bench_runner.py" --profile "$profile" "$bin_path")
+  if [[ "${#forward_args[@]}" -gt 0 ]]; then
+    runner_cmd+=(-- "${forward_args[@]}")
+  fi
+  "${runner_cmd[@]}" || status=1
 done
 
 exit "$status"

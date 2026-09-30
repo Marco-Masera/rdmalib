@@ -61,15 +61,17 @@ pub(crate) fn pin_current_thread(cpu: u32) -> io::Result<()> {
     if cpu >= CPU_SETSIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("cpu id {cpu} exceeds the affinity mask's limit of {}", CPU_SETSIZE - 1),
+            format!(
+                "cpu id {cpu} exceeds the affinity mask's limit of {}",
+                CPU_SETSIZE - 1
+            ),
         ));
     }
     let mut set: CpuSet = [0; CPU_SET_BYTES / 8];
     set[(cpu / 64) as usize] |= 1u64 << (cpu % 64);
-    check(
-        "sched_setaffinity",
-        unsafe { sched_setaffinity(0, CPU_SET_BYTES, &set) },
-    )
+    check("sched_setaffinity", unsafe {
+        sched_setaffinity(0, CPU_SET_BYTES, &set)
+    })
 }
 
 /// The CPUs the calling thread may run on, ascending by id.
@@ -80,10 +82,9 @@ pub(crate) fn pin_current_thread(cpu: u32) -> io::Result<()> {
 /// can pin to.
 pub(crate) fn current_thread_cpus() -> io::Result<Vec<u32>> {
     let mut set: CpuSet = [0; CPU_SET_BYTES / 8];
-    check(
-        "sched_getaffinity",
-        unsafe { sched_getaffinity(0, CPU_SET_BYTES, &mut set) },
-    )?;
+    check("sched_getaffinity", unsafe {
+        sched_getaffinity(0, CPU_SET_BYTES, &mut set)
+    })?;
     Ok((0..CPU_SETSIZE)
         .filter(|&cpu| set[(cpu / 64) as usize] & (1u64 << (cpu % 64)) != 0)
         .collect())

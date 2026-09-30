@@ -11,7 +11,8 @@
 //! between threads, while exclusive ownership keeps a single object
 //! used by one thread at a time.
 
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
+use std::any::Any;
+use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs};
@@ -112,8 +113,7 @@ struct IbvCompChannel {
 /// `ibv_post_send`, `ibv_poll_cq`, and `ibv_req_notify_cq` are static
 /// inline calls in `infiniband/verbs.h`, not library symbols: they
 /// dispatch through the command table of the device handle.
-type PostSendFn =
-    unsafe extern "C" fn(*mut IbvQp, *mut IbvSendWr, *mut *mut IbvSendWr) -> c_int;
+type PostSendFn = unsafe extern "C" fn(*mut IbvQp, *mut IbvSendWr, *mut *mut IbvSendWr) -> c_int;
 type PollCqFn = unsafe extern "C" fn(*mut IbvCq, c_int, *mut IbvWc) -> c_int;
 type ReqNotifyCqFn = unsafe extern "C" fn(*mut IbvCq, c_int) -> c_int;
 
@@ -388,10 +388,7 @@ unsafe extern "C" {
     fn ibv_ack_cq_events(cq: *mut IbvCq, nevents: c_uint);
     fn ibv_reg_mr(pd: *mut IbvPd, addr: *mut c_void, length: usize, access: c_int) -> *mut IbvMr;
     fn ibv_dereg_mr(mr: *mut IbvMr) -> c_int;
-    fn ibv_query_device(
-        context: *mut IbvContext,
-        device_attr: *mut IbvDeviceAttr,
-    ) -> c_int;
+    fn ibv_query_device(context: *mut IbvContext, device_attr: *mut IbvDeviceAttr) -> c_int;
     fn ibv_wc_status_str(status: c_int) -> *const c_char;
 }
 
@@ -458,10 +455,9 @@ fn check_ptr<T>(call: &str, ptr: *mut T) -> io::Result<*mut T> {
 /// convention exactly.
 fn query_device(context: *mut IbvContext) -> io::Result<IbvDeviceAttr> {
     let mut attr: IbvDeviceAttr = unsafe { std::mem::zeroed() };
-    check(
-        "ibv_query_device",
-        unsafe { ibv_query_device(context, &mut attr) },
-    )?;
+    check("ibv_query_device", unsafe {
+        ibv_query_device(context, &mut attr)
+    })?;
     Ok(attr)
 }
 
@@ -587,9 +583,39 @@ impl MemoryRegion {
     }
 }
 
+impl MemoryRegion {
+    /// Try to deregister, without dropping on failure: `false` —
+    /// an operation is still in flight on it, `EBUSY` — means the
+    /// region stays registered, and whoever owns the memory it pins
+    /// must keep both alive until a later attempt frees it. On
+    /// success the region is deregistered and inert (its `Drop` a
+    /// no-op). Runs on the engine thread.
+    ///
+    /// SAFETY-free by the same argument as `Drop`: the raw handle is
+    /// exclusively owned here, and a failed `ibv_dereg_mr` leaves it
+    /// valid.
+    pub(crate) fn try_deregister(&mut self) -> bool {
+        // SAFETY: the handle is ours alone; a failed deregistration
+        // leaves the region valid and reusable by a retry.
+        let ret = unsafe { ibv_dereg_mr(self.mr) };
+        if ret == 0 {
+            self.mr = std::ptr::null_mut();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl Drop for MemoryRegion {
     fn drop(&mut self) {
-        unsafe { ibv_dereg_mr(self.mr) };
+        // A nulled handle is an already-freed region (see
+        // `try_deregister`); an error here is ignored like every
+        // teardown error — the drop paths only run with no operation
+        // in flight on the region.
+        if !self.mr.is_null() {
+            unsafe { ibv_dereg_mr(self.mr) };
+        }
     }
 }
 
@@ -669,20 +695,17 @@ impl ProtectionDomain {
         if size == 0 {
             return Err(invalid("cannot register an empty region"));
         }
-        let mr = check_ptr(
-            "ibv_reg_mr",
-            unsafe {
-                ibv_reg_mr(
-                    self.inner.pd,
-                    addr as *mut c_void,
-                    size,
-                    IBV_ACCESS_LOCAL_WRITE
-                        | IBV_ACCESS_REMOTE_WRITE
-                        | IBV_ACCESS_REMOTE_READ
-                        | IBV_ACCESS_REMOTE_ATOMIC,
-                )
-            },
-        )?;
+        let mr = check_ptr("ibv_reg_mr", unsafe {
+            ibv_reg_mr(
+                self.inner.pd,
+                addr as *mut c_void,
+                size,
+                IBV_ACCESS_LOCAL_WRITE
+                    | IBV_ACCESS_REMOTE_WRITE
+                    | IBV_ACCESS_REMOTE_READ
+                    | IBV_ACCESS_REMOTE_ATOMIC,
+            )
+        })?;
         let (lkey, rkey) = unsafe { ((*mr).lkey, (*mr).rkey) };
         Ok(MemoryRegion {
             mr,
@@ -765,6 +788,21 @@ pub struct Connection {
     /// The connection's pooled registration, created lazily at the
     /// first pooled operation (see [`Pool`]); absent until then.
     pool: Option<Pool>,
+    /// The user-registered buffers of this connection (the reader
+    /// side's registered-buffer API): memory registered once, here
+    /// in the connection's domain, and posted against directly — no
+    /// pooled copy, no per-operation registration, no in-flight
+    /// hold. Registered and deregistered through the `OpSource` seam,
+    /// on the engine thread.
+    rbufs: Vec<MemoryRegion>,
+    /// Registered buffers whose deregistration found an operation
+    /// still in flight (`EBUSY`): the region and the memory it pins
+    /// park here — the memory never drops while the device can still
+    /// touch it — retried on the engine thread as operations pass,
+    /// and released at teardown (the engine's drain-then-exit
+    /// guarantees no operation in flight when the connection drops,
+    /// so the final attempt cannot fail for this reason).
+    closing_rbufs: Vec<(MemoryRegion, Box<dyn Any + Send>)>,
 }
 
 // SAFETY: the wrapped connection has no thread affinity (its domain
@@ -785,8 +823,9 @@ impl Connection {
     /// [`Self::connect_shared`].
     pub fn connect<A: ToSocketAddrs>(addr: A, max_send_wr: usize) -> io::Result<Self> {
         let mut dst = SockaddrIn::from(resolve_v4(addr)?);
-        let event_channel =
-            check_ptr("rdma_create_event_channel", unsafe { rdma_create_event_channel() })?;
+        let event_channel = check_ptr("rdma_create_event_channel", unsafe {
+            rdma_create_event_channel()
+        })?;
         let mut conn = Self {
             id: std::ptr::null_mut(),
             cq: std::ptr::null_mut(),
@@ -796,6 +835,8 @@ impl Connection {
             shared: None,
             max_send_wr: 0,
             pool: None,
+            rbufs: Vec::new(),
+            closing_rbufs: Vec::new(),
         };
         conn.connect_to(&mut dst, &[], max_send_wr)?;
         Ok(conn)
@@ -825,8 +866,9 @@ impl Connection {
         max_send_wr: usize,
     ) -> io::Result<(Self, Option<SharedCompletions>)> {
         let mut dst = SockaddrIn::from(resolve_v4(addr)?);
-        let event_channel =
-            check_ptr("rdma_create_event_channel", unsafe { rdma_create_event_channel() })?;
+        let event_channel = check_ptr("rdma_create_event_channel", unsafe {
+            rdma_create_event_channel()
+        })?;
         let mut conn = Self {
             id: std::ptr::null_mut(),
             cq: std::ptr::null_mut(),
@@ -836,6 +878,8 @@ impl Connection {
             shared: None,
             max_send_wr: 0,
             pool: None,
+            rbufs: Vec::new(),
+            closing_rbufs: Vec::new(),
         };
         let new_shared = conn.connect_to(&mut dst, shared, max_send_wr)?;
         Ok((conn, new_shared))
@@ -853,30 +897,25 @@ impl Connection {
         shared: &[SharedCompletions],
         max_send_wr: usize,
     ) -> io::Result<Option<SharedCompletions>> {
-        check(
-            "rdma_create_id",
-            unsafe {
-                rdma_create_id(
-                    self.event_channel,
-                    &mut self.id,
-                    std::ptr::null_mut(),
-                    RDMA_PS_TCP,
-                )
-            },
-        )?;
-        check(
-            "rdma_resolve_addr",
-            unsafe { rdma_resolve_addr(self.id, std::ptr::null_mut(), dst, RESOLVE_TIMEOUT_MS) },
-        )?;
+        check("rdma_create_id", unsafe {
+            rdma_create_id(
+                self.event_channel,
+                &mut self.id,
+                std::ptr::null_mut(),
+                RDMA_PS_TCP,
+            )
+        })?;
+        check("rdma_resolve_addr", unsafe {
+            rdma_resolve_addr(self.id, std::ptr::null_mut(), dst, RESOLVE_TIMEOUT_MS)
+        })?;
         wait_event(
             self.event_channel,
             RDMA_CM_EVENT_ADDR_RESOLVED,
             "rdma_resolve_addr",
         )?;
-        check(
-            "rdma_resolve_route",
-            unsafe { rdma_resolve_route(self.id, RESOLVE_TIMEOUT_MS) },
-        )?;
+        check("rdma_resolve_route", unsafe {
+            rdma_resolve_route(self.id, RESOLVE_TIMEOUT_MS)
+        })?;
         wait_event(
             self.event_channel,
             RDMA_CM_EVENT_ROUTE_RESOLVED,
@@ -902,7 +941,11 @@ impl Connection {
         self.create_resources(pd, shared.as_ref(), max_send_wr)?;
         let mut param = conn_param();
         check("rdma_connect", unsafe { rdma_connect(self.id, &mut param) })?;
-        wait_event(self.event_channel, RDMA_CM_EVENT_ESTABLISHED, "rdma_connect")?;
+        wait_event(
+            self.event_channel,
+            RDMA_CM_EVENT_ESTABLISHED,
+            "rdma_connect",
+        )?;
         Ok(new)
     }
 
@@ -930,14 +973,12 @@ impl Connection {
             Some(sc) => sc.raw_cq(),
             None => {
                 let context = unsafe { (*self.id).verbs };
-                let comp_channel = check_ptr(
-                    "ibv_create_comp_channel",
-                    unsafe { ibv_create_comp_channel(context) },
-                )?;
-                let cq = check_ptr(
-                    "ibv_create_cq",
-                    unsafe { ibv_create_cq(context, CQ_SIZE, std::ptr::null_mut(), comp_channel, 0) },
-                )?;
+                let comp_channel = check_ptr("ibv_create_comp_channel", unsafe {
+                    ibv_create_comp_channel(context)
+                })?;
+                let cq = check_ptr("ibv_create_cq", unsafe {
+                    ibv_create_cq(context, CQ_SIZE, std::ptr::null_mut(), comp_channel, 0)
+                })?;
                 self.comp_channel = comp_channel;
                 self.cq = cq;
                 cq
@@ -966,10 +1007,9 @@ impl Connection {
             qp_type: IBV_QPT_RC,
             sq_sig_all: 1,
         };
-        check(
-            "rdma_create_qp",
-            unsafe { rdma_create_qp(self.id, pd.raw(), &mut attr) },
-        )?;
+        check("rdma_create_qp", unsafe {
+            rdma_create_qp(self.id, pd.raw(), &mut attr)
+        })?;
         self.pd = Some(pd);
         self.max_send_wr = max_send_wr;
         Ok(())
@@ -1069,12 +1109,10 @@ impl Connection {
         // through the device's command table.
         let qp = unsafe { (*self.id).qp };
         let post_send = unsafe { (*(*qp).context).ops.post_send };
-        check(
-            "ibv_post_send",
-            unsafe { post_send(qp, &mut send_wr, &mut bad_wr) },
-        )
+        check("ibv_post_send", unsafe {
+            post_send(qp, &mut send_wr, &mut bad_wr)
+        })
     }
-
 }
 
 impl Drop for Connection {
@@ -1145,6 +1183,9 @@ impl OpSource for Connection {
         target: OpTarget,
         wr_id: u64,
     ) -> io::Result<Box<dyn InFlight>> {
+        // As operations pass, the deregistrations they were holding
+        // back (`EBUSY`, below) become possible again.
+        self.drain_closing_rbufs();
         let opcode = match op {
             Op::Read => IBV_WR_RDMA_READ,
             Op::Write => IBV_WR_RDMA_WRITE,
@@ -1187,6 +1228,83 @@ impl OpSource for Connection {
         Ok(Box::new(mr))
     }
 
+    fn register_buffer(&mut self, addr: u64, len: usize) -> io::Result<()> {
+        // One registration, in the connection's domain, for every
+        // operation the buffer's range serves from here on.
+        let mr = self.register_addr(addr, len)?;
+        self.rbufs.push(mr);
+        Ok(())
+    }
+
+    fn deregister_buffer(&mut self, addr: u64, len: usize, payload: Box<dyn Any + Send>) {
+        let Some(index) = self
+            .rbufs
+            .iter()
+            .position(|mr| mr.addr == addr && mr.size == len)
+        else {
+            // Not (or no longer) registered here: nothing can still
+            // touch the memory through this connection, so the
+            // payload may go.
+            return;
+        };
+        let mut mr = self.rbufs.swap_remove(index);
+        if mr.try_deregister() {
+            // Freed: the device is done, and the memory it pinned
+            // may go.
+            drop(payload);
+        } else {
+            // An operation is still in flight on it: both park,
+            // retried as operations pass — the memory never drops
+            // while the device can still touch it.
+            self.closing_rbufs.push((mr, payload));
+        }
+    }
+
+    fn submit_registered(
+        &mut self,
+        op: Op,
+        addr: u64,
+        len: usize,
+        target: OpTarget,
+        wr_id: u64,
+    ) -> io::Result<()> {
+        // As operations pass, the deregistrations they were holding
+        // back (`EBUSY`, above) become possible again.
+        self.drain_closing_rbufs();
+        let opcode = match op {
+            Op::Read => IBV_WR_RDMA_READ,
+            Op::Write => IBV_WR_RDMA_WRITE,
+        };
+        // The registered-buffer path: the operation posts directly
+        // against the registration covering its local memory — no
+        // pooled copy, no per-operation registration, no hold (the
+        // registration outlives the operation). A registered buffer's
+        // heap never overlaps another live allocation, so the range
+        // check cannot hit an unregistered buffer.
+        let mr = self
+            .rbufs
+            .iter()
+            .find(|mr| {
+                addr >= mr.addr && addr.saturating_add(len as u64) <= mr.addr + mr.size as u64
+            })
+            .ok_or_else(|| {
+                invalid(format!(
+                    "the {} at {addr} of {len} bytes is not on a buffer registered with the connection",
+                    op.name()
+                ))
+            })?;
+        self.post(
+            op.name(),
+            opcode,
+            mr,
+            (addr - mr.addr) as usize,
+            target.remote_addr,
+            target.rkey,
+            len,
+            wr_id,
+        )
+    }
+
     fn close(&mut self) {
         // Best effort: the queue pair moves to the error state and
         // its outstanding operations flush as error completions, which
@@ -1197,6 +1315,29 @@ impl OpSource for Connection {
 }
 
 impl Connection {
+    /// Retry the parked deregistrations (see [`Self::rbufs`]): as
+    /// operations pass, the in-flight holds that made them `EBUSY`
+    /// end, and the regions and the memory they pin may go. Runs on
+    /// the engine thread — from every submitted operation, and at
+    /// teardown through the region drops (the engine's
+    /// drain-then-exit guarantees no operation in flight when the
+    /// connection drops, so the final attempts cannot fail for this
+    /// reason).
+    fn drain_closing_rbufs(&mut self) {
+        if self.closing_rbufs.is_empty() {
+            return; // the common operation's path: one length check
+        }
+        let mut still_closing = Vec::new();
+        for (mut mr, payload) in self.closing_rbufs.drain(..) {
+            if mr.try_deregister() {
+                drop(payload);
+            } else {
+                still_closing.push((mr, payload));
+            }
+        }
+        self.closing_rbufs = still_closing;
+    }
+
     /// The pooled path of a submitted operation, when one fits: a
     /// slice of the connection's pooled registration lent out for it,
     /// with its offset into the registration (the post reads the
@@ -1426,14 +1567,15 @@ impl SharedCompletions {
     /// connections' depth checks.
     fn on_device(context: *mut IbvContext, min_depth: usize) -> io::Result<Self> {
         let attr = query_device(context)?;
-        let depth = SHARED_CQ_SIZE.max(min_depth).min(attr.max_cqe.max(0) as usize);
+        let depth = SHARED_CQ_SIZE
+            .max(min_depth)
+            .min(attr.max_cqe.max(0) as usize);
         let channel = check_ptr("ibv_create_comp_channel", unsafe {
             ibv_create_comp_channel(context)
         })?;
-        let cq = check_ptr(
-            "ibv_create_cq",
-            unsafe { ibv_create_cq(context, depth as c_int, std::ptr::null_mut(), channel, 0) },
-        )?;
+        let cq = check_ptr("ibv_create_cq", unsafe {
+            ibv_create_cq(context, depth as c_int, std::ptr::null_mut(), channel, 0)
+        })?;
         Ok(Self {
             inner: Arc::new(ScInner {
                 context,
@@ -1527,14 +1669,18 @@ impl CompletionSource for SharedCompletions {
     fn poll(&mut self, out: &mut [Completion]) -> io::Result<usize> {
         // A fixed batch of raw completions, at most the engine's sweep
         // batch (SWEEP_BATCH) per poll, from every connection posting
-        // into the shared queue.
-        let mut wc: [IbvWc; SWEEP_BATCH] = unsafe { std::mem::zeroed() };
+        // into the shared queue. The scratch is uninitialized — the
+        // queue writes `[0..ret]` fully, and only those are read —
+        // because a poll is one iteration of the engine's loop, a
+        // handoff granularity a sequential operation pays: no per-poll
+        // 1 KiB of zeroing on it.
+        let mut wc = [const { std::mem::MaybeUninit::<IbvWc>::uninit() }; SWEEP_BATCH];
         let want = out.len().min(SWEEP_BATCH);
         // ibv_poll_cq is a static inline call in verbs.h, dispatched
         // through the device's command table; a negative return is the
         // errno.
         let poll_cq = unsafe { (*(*self.inner.cq).context).ops.poll_cq };
-        let ret = unsafe { poll_cq(self.inner.cq, want as c_int, wc.as_mut_ptr()) };
+        let ret = unsafe { poll_cq(self.inner.cq, want as c_int, wc.as_mut_ptr().cast()) };
         if ret < 0 {
             return Err(io::Error::other(format!(
                 "ibv_poll_cq failed: {}",
@@ -1542,17 +1688,20 @@ impl CompletionSource for SharedCompletions {
             )));
         }
         for i in 0..ret as usize {
-            let ok = wc[i].status == IBV_WC_SUCCESS;
+            // SAFETY: the queue initialized this entry — the poll
+            // returned it as one of its `ret`.
+            let wc = unsafe { wc[i].assume_init_read() };
+            let ok = wc.status == IBV_WC_SUCCESS;
             out[i] = Completion {
-                wr_id: wc[i].wr_id,
+                wr_id: wc.wr_id,
                 ok,
                 error: if ok {
                     String::new()
                 } else {
                     format!(
                         "RDMA operation failed: {} (vendor error {})",
-                        status_str(wc[i].status),
-                        wc[i].vendor_err
+                        status_str(wc.status),
+                        wc.vendor_err
                     )
                 },
             };
@@ -1621,20 +1770,13 @@ impl Listener {
     /// create their resources on the device they arrive on.
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let mut sin = SockaddrIn::from(resolve_v4(addr)?);
-        let event_channel =
-            check_ptr("rdma_create_event_channel", unsafe { rdma_create_event_channel() })?;
+        let event_channel = check_ptr("rdma_create_event_channel", unsafe {
+            rdma_create_event_channel()
+        })?;
         let mut id: *mut RdmaCmId = std::ptr::null_mut();
-        check(
-            "rdma_create_id",
-            unsafe {
-                rdma_create_id(
-                    event_channel,
-                    &mut id,
-                    std::ptr::null_mut(),
-                    RDMA_PS_TCP,
-                )
-            },
-        )?;
+        check("rdma_create_id", unsafe {
+            rdma_create_id(event_channel, &mut id, std::ptr::null_mut(), RDMA_PS_TCP)
+        })?;
         let result = check("rdma_bind_addr", unsafe { rdma_bind_addr(id, &mut sin) })
             .and_then(|()| check("rdma_listen", unsafe { rdma_listen(id, LISTEN_BACKLOG) }));
         match result {
@@ -1673,10 +1815,9 @@ impl Listener {
 
     fn accept_impl(&self, pd: Option<&ProtectionDomain>) -> io::Result<Connection> {
         let mut event: *mut RdmaCmEvent = std::ptr::null_mut();
-        check(
-            "rdma_get_cm_event",
-            unsafe { rdma_get_cm_event(self.event_channel, &mut event) },
-        )?;
+        check("rdma_get_cm_event", unsafe {
+            rdma_get_cm_event(self.event_channel, &mut event)
+        })?;
         let (child, event_type, status) = unsafe { ((*event).id, (*event).event, (*event).status) };
         let ack = unsafe { rdma_ack_cm_event(event) };
         if event_type != RDMA_CM_EVENT_CONNECT_REQUEST || status != 0 {
@@ -1698,6 +1839,8 @@ impl Listener {
             shared: None,
             max_send_wr: 0,
             pool: None,
+            rbufs: Vec::new(),
+            closing_rbufs: Vec::new(),
         };
 
         let context = unsafe { (*child).verbs };
@@ -1740,7 +1883,7 @@ impl fmt::Debug for Listener {
 
 #[cfg(test)]
 mod tests {
-    use std::mem::{offset_of, size_of, align_of};
+    use std::mem::{align_of, offset_of, size_of};
 
     use super::*;
 

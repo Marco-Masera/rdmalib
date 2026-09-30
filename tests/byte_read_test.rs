@@ -70,7 +70,11 @@ fn test_public_api() {
         let catalog = reader.get_remote_mr_metadata();
         let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
         // The whole region...
-        let whole = region.read_async(0, expected.len()).unwrap().wait().unwrap();
+        let whole = region
+            .read_async(0, expected.len())
+            .unwrap()
+            .wait()
+            .unwrap();
         assert_eq!(whole, expected);
         // ...and a slice of it at a byte offset, into a buffer we own.
         let slice = region

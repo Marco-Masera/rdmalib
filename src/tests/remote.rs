@@ -36,7 +36,11 @@ fn region(elem_size: u32, elem_align: u32, elem_type: &str) -> RemoteMemoryRegio
 fn provider_starts_empty() {
     let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
     assert!(provider.get_remote_mr_metadata().is_empty());
-    assert!(provider.get_remote_mr(&metadata("missing", 0, 0), None).is_none());
+    assert!(
+        provider
+            .get_remote_mr(&metadata("missing", 0, 0), None)
+            .is_none()
+    );
     // Nothing connects until an update, and an update without a
     // reachable remote fails here.
     assert!(provider.update(0).is_err());
@@ -76,14 +80,23 @@ fn lookup_by_metadata_and_group() {
 
     let grouped = provider.get_remote_mr(&heap, Some(3)).unwrap();
     assert_eq!(
-        (grouped.remote_addr, grouped.size, grouped.rkey, grouped.group),
+        (
+            grouped.remote_addr,
+            grouped.size,
+            grouped.rkey,
+            grouped.group
+        ),
         (0x2000, 8192, 2, 3)
     );
     assert_eq!((grouped.elem_size, grouped.elem_align), (8, 8));
 
     assert!(provider.get_remote_mr(&heap, Some(7)).is_none());
     // Same name, different id: a different region.
-    assert!(provider.get_remote_mr(&metadata("heap", 8, 12288), None).is_none());
+    assert!(
+        provider
+            .get_remote_mr(&metadata("heap", 8, 12288), None)
+            .is_none()
+    );
     assert_eq!(provider.get_remote_mr_metadata(), vec![heap]);
 }
 

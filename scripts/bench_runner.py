@@ -8,35 +8,46 @@ variables:
   RDMALIB_TEST_MY_NODE   index of the node the process runs on
   RDMALIB_TEST_NODES     comma-separated "<ip>:<tcp-port>:<rdma-port>"
 
+After the run:
+  - The JSON latency file is rsynced from the client node back to
+    benchmarks/results/<bench_name>/<bench_name>_<timestamp>.json
+  - The terminal summary (the ====...==== block) is also saved as
+    benchmarks/results/<bench_name>/<bench_name>_<timestamp>.txt
+
 Usage:
-  scripts/bench_runner.py <binary_path> [-- <bench_args...>]
-  scripts/bench_runner.py --bench <bench_name> [--profile release|debug] [-- <bench_args...>]
+  scripts/bench_runner.py [--profile release|debug] <binary_path> [-- <bench_args...>]
+  scripts/bench_runner.py --list
 """
 
 import argparse
 import asyncio
 import json
-import os
-from pathlib import Path
+import re
 import subprocess
 import sys
+from datetime import datetime
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_FILE = ROOT / "benchmarks" / "_bench_config.json"
+RESULTS_DIR = ROOT / "benchmarks" / "results"
 
 ENV_NODES = "RDMALIB_TEST_NODES"
 ENV_MY_NODE = "RDMALIB_TEST_MY_NODE"
 
 
-async def stream_pipe(pipe, prefix):
+async def stream_pipe(pipe, prefix, lines_out: list):
+    """Stream lines from a pipe, printing with prefix and collecting into lines_out."""
     while True:
         line = await pipe.readline()
         if not line:
             break
-        print(f"[{prefix}] {line.decode().rstrip()}", flush=True)
+        text = line.decode().rstrip()
+        print(f"[{prefix}] {text}", flush=True)
+        lines_out.append((prefix, text))
 
 
-async def run_on_node(hostname, remote_cmd):
+async def run_on_node(hostname, remote_cmd, lines_out: list):
     """Launches the benchmark process on a single node concurrently."""
     process = await asyncio.create_subprocess_exec(
         "ssh",
@@ -47,8 +58,8 @@ async def run_on_node(hostname, remote_cmd):
     )
 
     await asyncio.gather(
-        stream_pipe(process.stdout, f"{hostname}/stdout"),
-        stream_pipe(process.stderr, f"{hostname}/stderr"),
+        stream_pipe(process.stdout, f"{hostname}/stdout", lines_out),
+        stream_pipe(process.stderr, f"{hostname}/stderr", lines_out),
     )
 
     return hostname, await process.wait()
@@ -62,7 +73,48 @@ def load_config():
         return json.load(f)
 
 
+def extract_summary(lines: list, client_hostname: str) -> str:
+    """Extract the ===...=== summary block from the client node's stdout.
+
+    The block layout emitted by print_summary is:
+        =======...=======   ← separator 1 (opening)
+        === <title>
+        =======...=======   ← separator 2 (after title)
+        <data lines>
+        =======...=======   ← separator 3 (closing)
+    We collect everything from separator 1 through separator 3 inclusive.
+    """
+    summary_lines = []
+    in_block = False
+    sep_count = 0
+    for prefix, text in lines:
+        if f"{client_hostname}/stdout" not in prefix:
+            continue
+        if text.startswith("======="):
+            sep_count += 1
+            if sep_count == 1:
+                in_block = True
+            if in_block:
+                summary_lines.append(text)
+            if sep_count == 3:
+                # Closing separator collected; done.
+                in_block = False
+                sep_count = 0
+            continue
+        if in_block:
+            summary_lines.append(text)
+    return "\n".join(summary_lines)
+
+
 def main():
+    if "--" in sys.argv:
+        dash_idx = sys.argv.index("--")
+        runner_argv = sys.argv[1:dash_idx]
+        bench_args = sys.argv[dash_idx + 1:]
+    else:
+        runner_argv = sys.argv[1:]
+        bench_args = []
+
     parser = argparse.ArgumentParser(
         description="Deploy and run rdmalib cluster benchmarks."
     )
@@ -86,13 +138,9 @@ def main():
         action="store_true",
         help="List available benchmarks in config",
     )
-    parser.add_argument(
-        "bench_args",
-        nargs=argparse.REMAINDER,
-        help="Arguments forwarded to the benchmark binary (use after --)",
-    )
 
-    args = parser.parse_args()
+    args, extra = parser.parse_known_args(runner_argv)
+    bench_args = bench_args + extra
     config = load_config()
 
     if args.list:
@@ -102,11 +150,6 @@ def main():
             desc = spec.get("description", "")
             print(f"  - {name:20} (nodes: {nodes}) {desc}")
         sys.exit(0)
-
-    # Clean up forwarded args if '--' was passed
-    bench_args = args.bench_args
-    if bench_args and bench_args[0] == "--":
-        bench_args = bench_args[1:]
 
     # Resolve benchmark name and binary path
     target = args.bench or args.binary_or_bench
@@ -119,10 +162,8 @@ def main():
         bench_name = binary_path.name
     else:
         bench_name = target
-        # Look in target-cluster/<profile>/
         binary_path = ROOT / "target-cluster" / args.profile / bench_name
         if not binary_path.exists():
-            # Also check target-cluster/<profile>/deps or plain target/
             alt_path = ROOT / "target" / args.profile / bench_name
             if alt_path.exists():
                 binary_path = alt_path
@@ -136,7 +177,6 @@ def main():
 
     bench_cfg = config.get("benchmarks", {}).get(bench_name)
     if bench_cfg is None:
-        # Default fallback to first 2 nodes if benchmark isn't specifically mapped
         print(
             f"[bench_runner] Note: benchmark '{bench_name}' not listed in {CONFIG_FILE}. Defaulting to nodes [0, 1]."
         )
@@ -153,6 +193,15 @@ def main():
     remote_dir = config.get("remote_path", "/tmp/rdmalib-benchmarks")
     remote_binary_path = f"{remote_dir}/{binary_path.name}"
 
+    # Timestamped filename used for both the remote JSON and the local results.
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    result_stem = f"{bench_name}_{timestamp}"
+    remote_json_path = f"{remote_dir}/{result_stem}.json"
+
+    # Inject --output into bench_args (only if the user hasn't already passed one).
+    if "--output" not in bench_args and "-o" not in bench_args:
+        bench_args = [*bench_args, "--output", remote_json_path]
+
     print(
         f"\n[bench_runner] Deploying '{bench_name}' on "
         f"{[n['hostname'] for n in nodes_config]} node(s) (profile: {args.profile}).",
@@ -165,7 +214,7 @@ def main():
     for node in nodes_config:
         subprocess.run(["ssh", node["hostname"], f"mkdir -p {remote_dir}"], check=True)
         subprocess.run(
-            ["rsync", "-avz", str(binary_path), f"{node['hostname']}:{remote_binary_path}"],
+            ["rsync", "-az", str(binary_path), f"{node['hostname']}:{remote_binary_path}"],
             check=True,
         )
 
@@ -186,7 +235,9 @@ def main():
         for n in ports_and_addresses
     )
 
-    # 3. Launch concurrently
+    # 3. Launch concurrently, collecting all output lines
+    all_lines: list = []
+
     async def run_cluster():
         tasks = [
             run_on_node(
@@ -198,6 +249,7 @@ def main():
                     remote_binary_path,
                     *bench_args,
                 ]),
+                all_lines,
             )
             for i, node in enumerate(nodes_config)
         ]
@@ -215,7 +267,41 @@ def main():
             )
             failed = True
 
-    sys.exit(1 if failed else 0)
+    if failed:
+        sys.exit(1)
+
+    # 5. Copy results from the client node (node index 1 in a 2-node layout,
+    #    or the last node in general — measurements always run on non-server nodes).
+    #    The client is nodes_config[1] when len > 1, else nodes_config[0].
+    client_node = nodes_config[1] if len(nodes_config) > 1 else nodes_config[0]
+    client_hostname = client_node["hostname"]
+
+    local_results_dir = RESULTS_DIR / bench_name
+    local_results_dir.mkdir(parents=True, exist_ok=True)
+
+    local_json = local_results_dir / f"{result_stem}.json"
+    local_txt = local_results_dir / f"{result_stem}.txt"
+
+    print(f"\n[bench_runner] Fetching results from '{client_hostname}'...", flush=True)
+    rsync_result = subprocess.run(
+        ["rsync", "-az", f"{client_hostname}:{remote_json_path}", str(local_json)],
+    )
+    if rsync_result.returncode != 0:
+        print(
+            f"[bench_runner] WARNING: could not fetch {remote_json_path} from {client_hostname}. "
+            f"The run may have failed before writing results.",
+            file=sys.stderr,
+        )
+    else:
+        print(f"[bench_runner] JSON results saved to: {local_json}", flush=True)
+
+    # 6. Extract and save the summary block
+    summary = extract_summary(all_lines, client_hostname)
+    if summary:
+        local_txt.write_text(summary + "\n")
+        print(f"[bench_runner] Summary saved to:      {local_txt}", flush=True)
+    else:
+        print("[bench_runner] WARNING: no summary block found in output.", file=sys.stderr)
 
 
 if __name__ == "__main__":

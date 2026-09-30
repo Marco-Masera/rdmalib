@@ -28,13 +28,60 @@
       "id": 4,
       "hostname": "node7",
       "ip": "192.168.4.7"
+    },
+    {
+      "id": 5,
+      "hostname": "node63",
+      "ip": "192.168.3.63"
+    },
+    {
+      "id": 6,
+      "hostname": "node64",
+      "ip": "192.168.3.64"
     }
   ],
   "remote_path": "/home/maserm/throwaway/benchmarks",
 
   "benchmarks": {
-    "read_latency": {
-      "nodes": [0, 1]
+    "single_read_untyped": {
+      "nodes": [0, 1],
+      "description": "Single Read, single word (8 B), untyped"
+    },
+    "single_write_untyped": {
+      "nodes": [0, 1],
+      "description": "Single Write, single word (8 B), untyped"
+    },
+    "single_read_typed": {
+      "nodes": [0, 1],
+      "description": "Single Read, multiple words, typed (8-word struct, 1/4/16/32 entries)"
+    },
+    "single_write_typed": {
+      "nodes": [0, 1],
+      "description": "Single Write, multiple words, typed (8-word struct, 1/4/16/32 entries)"
+    },
+    "single_read_rbuf": {
+      "nodes": [0, 1],
+      "description": "Single Read, typed, on a registered buffer (zero-copy, 1/4/16/32 entries)"
+    },
+    "single_write_rbuf": {
+      "nodes": [0, 1],
+      "description": "Single Write, typed, on a registered buffer (zero-copy, 1/4/16/32 entries)"
+    },
+    "concurrent_read_untyped": {
+      "nodes": [0, 1],
+      "description": "Concurrent Untyped Reads (16/32 ops, 1 word each, independent sections)"
+    },
+    "concurrent_write_untyped": {
+      "nodes": [0, 1],
+      "description": "Concurrent Untyped Writes (16/32 ops, 1 word each, independent sections)"
+    },
+    "concurrent_read_typed": {
+      "nodes": [0, 1],
+      "description": "Concurrent Typed Reads (16/32 ops, 1 Word8 entry each, independent sections)"
+    },
+    "concurrent_write_typed": {
+      "nodes": [0, 1],
+      "description": "Concurrent Typed Writes (16/32 ops, 1 Word8 entry each, independent sections)"
     }
   }
 }

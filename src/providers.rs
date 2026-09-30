@@ -12,7 +12,7 @@
 //! choice and connecting over RDMA into the group's protection
 //! domain, then receiving the region catalog and the group's tuples.
 
-use std::any::{type_name, Any};
+use std::any::{Any, type_name};
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::io;
@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::meta::{Channel, Message, RegionDesc, TupleDesc, PROTOCOL_VERSION};
+use crate::meta::{Channel, Message, PROTOCOL_VERSION, RegionDesc, TupleDesc};
 use crate::os;
 use crate::rdma;
 use crate::{Engine, RemoteSafe};
@@ -552,7 +552,10 @@ impl Shared {
                 });
             }
         }
-        (Message::Metadata { regions }, Message::Tuples { group, tuples })
+        (
+            Message::Metadata { regions },
+            Message::Tuples { group, tuples },
+        )
     }
 }
 
