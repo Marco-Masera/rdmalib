@@ -5,6 +5,7 @@
 //! structures for typed benchmarks (`Word8`), and runner routines for single
 //! and concurrent RDMA read/write benchmarks.
 
+use std::collections::HashMap;
 use std::env;
 use std::ffi::c_int;
 use std::fmt;
@@ -13,7 +14,6 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::task::{Context, Poll};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -342,6 +342,17 @@ fn parse_node(index: usize, spec: &str) -> Result<NodeInfo, String> {
 }
 
 const SYNCH_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How long a round's responder outlives the round's close: a close
+/// proves every peer answered this node's request, not that every
+/// peer observed this node's clock — a peer still inside its own
+/// round only learns this node's clock by polling this node, which it
+/// does every `SYNCH_POLL_INTERVAL` — so holding the answering
+/// listener open for a handful of intervals past the close guarantees
+/// the straggler's poll lands. Without it, a round satisfied by its
+/// first reply closed in milliseconds and tore the responder down
+/// before a peer that had yet to observe the entry ever got an
+/// answer — the teardown flake this linger removed.
+const SYNCH_LINGER: Duration = Duration::from_millis(100);
 const SYNCH_IO_TIMEOUT: Duration = Duration::from_millis(1000);
 const SYNCH_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -352,7 +363,6 @@ pub struct GlobalSynch {
     port: u16,
     timeout: Duration,
     clock: u64,
-    known_clocks: Vec<u64>,
 }
 
 impl GlobalSynch {
@@ -383,7 +393,6 @@ impl GlobalSynch {
             port,
             timeout: SYNCH_TIMEOUT,
             clock: 0,
-            known_clocks: vec![0; cluster.len().saturating_sub(1)],
         }
     }
 
@@ -396,16 +405,28 @@ impl GlobalSynch {
         let listener = TcpListener::bind(SocketAddrV4::new(self.my_ip, self.port))?;
         listener.set_nonblocking(true)?;
 
-        let (seen_tx, seen_rx) = mpsc::channel::<(IpAddr, u64)>();
+        // The round's contract is mutual observation — every peer
+        // entered the round, and every peer observed this node's
+        // entry — and the acknowledgment rides the replies: a reply
+        // carries the responder's round and the highest request of
+        // *the poller's* it has ever answered, so one round-trip per
+        // peer per round proves both directions at once. Simpler
+        // contracts deadlocked or raced: closing on the peers' clocks
+        // alone let a node whose view carried over from an earlier
+        // poll tear its responder down before a still-observing peer
+        // ever got an answer (the teardown flake this once was), and
+        // tracking separately which peers had polled let satisfied
+        // peers — which stop polling — strand the tracked flag.
         let shutdown = Arc::new(AtomicBool::new(false));
         let my_clock = self.clock;
         let responder = {
             let shutdown = Arc::clone(&shutdown);
             thread::spawn(move || {
+                let mut answered_max: HashMap<IpAddr, u64> = HashMap::new();
                 while !shutdown.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            let _ = answer(stream, my_clock, &seen_tx);
+                            let _ = answer(stream, my_clock, &mut answered_max);
                         }
                         Err(_) => thread::sleep(SYNCH_POLL_INTERVAL),
                     }
@@ -413,46 +434,56 @@ impl GlobalSynch {
             })
         };
 
+        // Per peer, the freshest reply: (the peer's round, the
+        // highest request of this node's the peer has answered).
+        let mut seen: Vec<(u64, u64)> = vec![(0, 0); self.peers.len()];
+        let satisfied = |seen: &[(u64, u64)]| {
+            seen.iter()
+                .all(|&(clock, ack)| clock >= round && ack >= round)
+        };
+
         let deadline = Instant::now() + self.timeout;
         loop {
-            while let Ok((ip, clock)) = seen_rx.try_recv() {
-                if let Some(index) = self.peers.iter().position(|&peer| IpAddr::from(peer) == ip) {
-                    self.known_clocks[index] = self.known_clocks[index].max(clock);
-                }
-            }
-            let mut heard_from_all = true;
             for (index, &peer) in self.peers.iter().enumerate() {
-                if self.known_clocks[index] >= round {
+                let (clock, ack) = seen[index];
+                if clock >= round && ack >= round {
                     continue;
                 }
-                heard_from_all = false;
-                if let Ok(clock) = self.poll(peer) {
-                    self.known_clocks[index] = self.known_clocks[index].max(clock);
+                if let Ok(reply) = self.poll(peer) {
+                    seen[index] = reply;
                 }
             }
-            if heard_from_all {
+            if satisfied(&seen) {
                 break;
             }
             if Instant::now() >= deadline {
-                self.bail_out(round);
+                self.bail_out(round, &seen);
             }
             thread::sleep(SYNCH_POLL_INTERVAL);
         }
 
+        // The linger above: the responder keeps answering past the
+        // close, so a peer that has not yet observed this round's
+        // clock still can. Its cost is one linger per round, off the
+        // measured paths (the barrier brackets them).
+        thread::sleep(SYNCH_LINGER);
         shutdown.store(true, Ordering::Relaxed);
         let _ = responder.join();
         Ok(())
     }
 
-    fn bail_out(&self, round: u64) -> ! {
+    fn bail_out(&self, round: u64, seen: &[(u64, u64)]) -> ! {
         let waiting: Vec<String> = self
             .peers
             .iter()
-            .zip(&self.known_clocks)
-            .filter(|&(_, &known)| known < round)
-            .map(|(peer, &known)| match known {
-                0 => format!("{peer} (never heard from)"),
-                _ => format!("{peer} (last clock {known})"),
+            .zip(seen)
+            .filter(|&(_, &(clock, ack))| clock < round || ack < round)
+            .map(|(peer, &(clock, ack))| {
+                if clock == 0 && ack == 0 {
+                    format!("{peer} (never heard from)")
+                } else {
+                    format!("{peer} (last clock {clock}, acknowledged {ack})")
+                }
             })
             .collect();
         eprintln!(
@@ -466,22 +497,24 @@ impl GlobalSynch {
         std::process::exit(1)
     }
 
-    fn poll(&self, peer: Ipv4Addr) -> io::Result<u64> {
+    fn poll(&self, peer: Ipv4Addr) -> io::Result<(u64, u64)> {
         let addr = SocketAddr::V4(SocketAddrV4::new(peer, self.port));
         let mut stream = TcpStream::connect_timeout(&addr, SYNCH_IO_TIMEOUT)?;
         stream.set_read_timeout(Some(SYNCH_IO_TIMEOUT))?;
         stream.set_write_timeout(Some(SYNCH_IO_TIMEOUT))?;
         stream.write_all(&self.clock.to_le_bytes())?;
-        let mut reply = [0u8; 8];
+        let mut reply = [0u8; 16];
         stream.read_exact(&mut reply)?;
-        Ok(u64::from_le_bytes(reply))
+        let clock = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+        let ack = u64::from_le_bytes(reply[8..16].try_into().unwrap());
+        Ok((clock, ack))
     }
 }
 
 fn answer(
     mut stream: TcpStream,
     my_clock: u64,
-    seen: &mpsc::Sender<(IpAddr, u64)>,
+    answered_max: &mut HashMap<IpAddr, u64>,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(SYNCH_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(SYNCH_IO_TIMEOUT))?;
@@ -489,8 +522,10 @@ fn answer(
     stream.read_exact(&mut request)?;
     let their_clock = u64::from_le_bytes(request);
     let peer_ip = stream.peer_addr()?.ip();
-    let _ = seen.send((peer_ip, their_clock));
-    let reply = my_clock.to_le_bytes();
+    let ack = answered_max.entry(peer_ip).or_insert(0);
+    *ack = (*ack).max(their_clock);
+    let mut reply = my_clock.to_le_bytes().to_vec();
+    reply.extend_from_slice(&ack.to_le_bytes());
     stream.write_all(&reply)
 }
 

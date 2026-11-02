@@ -18,14 +18,23 @@ use std::io;
 use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::os::fd::RawFd;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::engine::{Completion, CompletionSource, InFlight, Op, OpSource, OpTarget, SWEEP_BATCH};
+use crate::os::{POLLIN, PollFd, poll_fds};
 
 /// RDMA port space used by the connections: TCP-style, reliable.
 const RDMA_PS_TCP: c_int = 0x0106;
 
 /// Timeout of the address and route resolution, in milliseconds.
 const RESOLVE_TIMEOUT_MS: c_int = 2000;
+
+/// How long the teardown waits for the disconnect exchange's events
+/// (see [`drain_cm_events`]): the reply a healthy peer's kernel owes
+/// arrives in microseconds to milliseconds, so the budget only ever
+/// runs out for a peer that is gone — which must not wedge the
+/// teardown; past it the destroys below proceed best effort.
+const CM_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Depth of a connection's own completion queue; the queue pair is
 /// created with as many send work requests.
@@ -80,6 +89,7 @@ const RDMA_CM_EVENT_ADDR_RESOLVED: c_int = 0;
 const RDMA_CM_EVENT_ROUTE_RESOLVED: c_int = 2;
 const RDMA_CM_EVENT_CONNECT_REQUEST: c_int = 4;
 const RDMA_CM_EVENT_ESTABLISHED: c_int = 9;
+const RDMA_CM_EVENT_DISCONNECTED: c_int = 10;
 
 // The structs below mirror the C layouts; some of their fields are
 // never read from Rust and exist only to keep the offsets of the
@@ -176,7 +186,7 @@ struct IbvSrq {
 /// (`struct rdma_event_channel`).
 #[repr(C)]
 struct RdmaEventChannel {
-    _private: [u8; 0],
+    fd: c_int,
 }
 
 /// A registered memory region (`struct ibv_mr`).
@@ -529,6 +539,64 @@ fn wait_event(channel: *mut RdmaEventChannel, expected: c_int, step: &str) -> io
     check("rdma_ack_cm_event", ack)
 }
 
+/// Acknowledge the communication events waiting on `id`'s channel,
+/// within `budget`, until the DISCONNECTED of `id` itself is
+/// acknowledged — the one [`rdma_disconnect`] triggers once the
+/// peer's reply lands. The destroys that follow require it —
+/// "Destruction of an rdma_cm_id will block until related events have
+/// been acknowledged" (upstream `rdma_cma.h`, on `rdma_get_cm_event`)
+/// — and the unacknowledged DISCONNECTED was the teardown hang this
+/// drain removed: without it the destroy raced the event's arrival
+/// and lost roughly one run in six, wedging the engine thread (the
+/// join that waits for it is the process's silent hang at the end of
+/// a benchmark). Events of other identifiers are acknowledged on the
+/// way — every acknowledged event releases the reference its
+/// identifier would otherwise wait on. Bounded where the C++
+/// library's equivalent drain is not (a blocking `rdma_get_cm_event`
+/// in `old_cpp_lib/conn.cpp`): past the budget the destroys proceed
+/// best effort, exactly as before this drain existed.
+///
+/// [`rdma_disconnect`]: crate::rdma::verbs::Connection::close
+fn drain_cm_events(id: *mut RdmaCmId, budget: Duration) {
+    if id.is_null() {
+        return;
+    }
+    let channel = unsafe { (*id).channel };
+    if channel.is_null() {
+        return;
+    }
+    let start = Instant::now();
+    loop {
+        let Some(remaining) = budget.checked_sub(start.elapsed()) else {
+            return;
+        };
+        let fd = unsafe { (*channel).fd };
+        let mut polled = [PollFd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        }];
+        // The channel's descriptor reports readiness only while
+        // events wait on it: a poll timeout is the common exit —
+        // nothing of this identifier is left.
+        match poll_fds(&mut polled, remaining.as_millis() as c_int) {
+            Ok(ready) if ready > 0 => {}
+            _ => return,
+        }
+        let mut event: *mut RdmaCmEvent = std::ptr::null_mut();
+        // A readiness can still come up empty (a stale one): an
+        // empty get leaves nothing to acknowledge.
+        if unsafe { rdma_get_cm_event(channel, &mut event) } != 0 {
+            return;
+        }
+        let (event_id, event_type) = unsafe { ((*event).id, (*event).event) };
+        unsafe { rdma_ack_cm_event(event) };
+        if event_id == id && event_type == RDMA_CM_EVENT_DISCONNECTED {
+            return;
+        }
+    }
+}
+
 /// A locally registered memory region.
 ///
 /// Registering a buffer on a [`Connection`] pins it for RDMA access
@@ -779,6 +847,10 @@ pub struct Connection {
     /// alive until this queue pair is destroyed; without one, the
     /// connection owns its queue and channel itself.
     shared: Option<SharedCompletions>,
+    /// Whether [`Self::close`] already fired the disconnect — its
+    /// events were acknowledged there, so the drop must not wait for
+    /// them again.
+    disconnected: bool,
     /// The send-queue depth this connection posts with — the
     /// operations that may be in flight on it at once. Set at resource
     /// creation; the send-queue bound of the engine's submissions
@@ -833,6 +905,7 @@ impl Connection {
             comp_channel: std::ptr::null_mut(),
             event_channel,
             shared: None,
+            disconnected: false,
             max_send_wr: 0,
             pool: None,
             rbufs: Vec::new(),
@@ -876,6 +949,7 @@ impl Connection {
             comp_channel: std::ptr::null_mut(),
             event_channel,
             shared: None,
+            disconnected: false,
             max_send_wr: 0,
             pool: None,
             rbufs: Vec::new(),
@@ -1127,7 +1201,14 @@ impl Drop for Connection {
         unsafe {
             if !self.id.is_null() {
                 if !(*self.id).qp.is_null() {
-                    rdma_disconnect(self.id);
+                    if !self.disconnected && rdma_disconnect(self.id) == 0 {
+                        // A connection the engine never destroyed
+                        // (its caller leaked it, or the engine's
+                        // shutdown drops it): this drop fires the
+                        // exchange itself, and waits for its events
+                        // before the destroys below.
+                        drain_cm_events(self.id, CM_DRAIN_TIMEOUT);
+                    }
                     rdma_destroy_qp(self.id);
                 }
                 rdma_destroy_id(self.id);
@@ -1310,7 +1391,13 @@ impl OpSource for Connection {
         // its outstanding operations flush as error completions, which
         // the engine resolves; an error (an id never fully connected)
         // is ignored — the drop that follows tears it down anyway.
-        unsafe { rdma_disconnect(self.id) };
+        if unsafe { rdma_disconnect(self.id) } == 0 {
+            self.disconnected = true;
+            // The exchange's events must be acknowledged before the
+            // destroys that follow them (see [`drain_cm_events`]):
+            // an event left waiting is a destroy that never returns.
+            drain_cm_events(self.id, CM_DRAIN_TIMEOUT);
+        }
     }
 }
 
@@ -1837,6 +1924,7 @@ impl Listener {
             // this connection must not destroy.
             event_channel: std::ptr::null_mut(),
             shared: None,
+            disconnected: false,
             max_send_wr: 0,
             pool: None,
             rbufs: Vec::new(),
@@ -1867,6 +1955,12 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
+        // The accept loop acknowledged every request it handled; a
+        // connect that raced the loop's stop may have left one
+        // waiting — clear what is already there, without budget
+        // (the service thread is stopping, not waiting), best effort
+        // like everything in this drop.
+        drain_cm_events(self.id, Duration::ZERO);
         unsafe {
             rdma_destroy_id(self.id);
             rdma_destroy_event_channel(self.event_channel);
@@ -1951,5 +2045,8 @@ mod tests {
         assert_eq!(offset_of!(RdmaCmId, verbs), 0);
         assert_eq!(offset_of!(RdmaCmId, channel), 8);
         assert_eq!(offset_of!(RdmaCmId, qp), 24);
+        // `struct rdma_event_channel { int fd; }` — the whole struct.
+        assert_eq!(size_of::<RdmaEventChannel>(), 4);
+        assert_eq!(offset_of!(RdmaEventChannel, fd), 0);
     }
 }

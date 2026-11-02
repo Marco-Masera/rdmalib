@@ -1,7 +1,7 @@
 # Async operations engine — design
 
 Status: agreed design; implementation in the step order below. Steps
-0–11 are done: the affinity FFI; the provider service-thread pinning;
+0–12 are done: the affinity FFI; the provider service-thread pinning;
 the wake channel (`pipe`/`poll(2)`); the engine itself (mailbox,
 slab, waker-driven op handles, idle blocking on the wake channel,
 drain-then-exit); the verbs `post`/`poll` split behind the seam
@@ -44,7 +44,16 @@ the wake channel too, not only the hybrid one, so a strict
 submit-and-wait loop finds the engine hot and pays no wake for it
 (the first benchmarks measured ~24 µs per sequential op: two
 block-and-wake cycles, the engine's and the waiter's); the default
-window raised to 256 µs accordingly.
+window raised to 256 µs accordingly; and the lock-free submit/resolve
+slab — the operation slots behind per-slot phases (submitted,
+waiting, resolved, abandoned) on an append-only chunk table with a
+generation-tagged free list, and the connections behind handout
+tickets (`ConnRef`: the id, the depth, the in-flight count, the
+liveness flag) that carry the eager send-queue bound without a lock —
+the last shared mutexes off the operation path: the sequential
+machinery floor 1.48 → 1.27 µs p50 (fakes), and the 16-op concurrent
+groups, where the waiters' hammering of the slab was contention,
+38.75 → 28.11 µs p50 (read) and 33.34 → 27.25 µs (write).
 
 Goals and invariants not restated here live in `AGENTS.md`; this doc
 extends them with the operations path: one-sided reads and writes as
@@ -531,6 +540,21 @@ let buffer = region.read_async(0, 4096)?.wait()?;
       µs p50**, read 6.14 → **5.76 µs p50** — ~0.4–0.5 µs, the
       pool's copy and the buffer's move through the slot gone.
 
+  12. **(done)** The lock-free submit/resolve slab (the section
+      below): the per-slot phase protocol replacing the slab mutex —
+      the slots behind `AtomicU8` phases and an `UnsafeCell` payload
+      with a documented ownership table, the free list a
+      generation-tagged Treiber stack over an append-only chunk
+      table, and the connections behind `ConnRef` tickets that carry
+      the eager send-queue bound. The sequential singles moved by
+      −0.04…−0.09 µs p50 (uniformly, all four — within day-to-day
+      noise: an uncontended mutex pair and the phase dance cost
+      about the same on these 2008-era cores); the machinery floor
+      (fakes) 1.48 → **1.27 µs p50**; the traced completion segment
+      0.81 → **0.51 µs**; and the 16-op concurrent groups, where the
+      waiters' slab polling was real contention, dropped
+      **38.75 → 28.11 µs p50 (read) and 33.34 → 27.25 µs (write)**.
+
 ## Registered buffers (step 11)
 
 The measured follow-on to the pool (the last of the open questions
@@ -584,6 +608,87 @@ singles.
   end against the fakes (register, read into, write from, the
   group-mismatch rejection, the drop's deregistration), and the
   benchmarks' `single_{read,write}_rbuf` for the real half.
+
+## The lock-free slab (step 12)
+
+The step-9 audit left the operation path lock-free only while both
+threads were hot; the slab itself — the operation slots — stayed
+behind a mutex, every submit, resolve, poll, and drop taking a pair.
+Uncontended, a pair is tens of nanoseconds (the sequential singles
+barely noticed); contended, it is a cache-line ping-pong with a
+descheduler attached — and sixteen waiters polling their completions
+contend it on every operation of every one of them. Done: the mutex
+is gone.
+
+- **The slots.** `Slot { generation: AtomicU32, phase: AtomicU8,
+  waker_lock: AtomicBool, free_next: AtomicU32, done: Arc<AtomicBool>,
+  data: UnsafeCell<SlotData> }`, `SlotData` holding the connection
+  ticket, the in-flight hold, the resolved outcome, the waker, and
+  the trace stamps. The `UnsafeCell` is sound by the phase protocol —
+  the safety argument is a table on `SlotData` saying which thread
+  may touch which field in which phase: `EMPTY` means the submitter
+  is writing and nobody else may read; `SUBMITTED` means the engine
+  and the handle both act (the engine resolving forward, the handle
+  registering a waker or abandoning); `WAITING` means the handle
+  parked and only the engine may complete it (the waker is stored
+  under the `waker_lock` spinlock, so a completing engine and a
+  re-polling waiter cannot miss each other: the store re-checks the
+  phase, the take happens under the same lock); `RESOLVED` hands the
+  outcome to whichever of engine and handle gets there, the loser
+  reclaiming the slot; `ABANDONED` means the handle is gone and the
+  engine reclaims. `Slot::data` and `Slot::data_mut` are the only
+  doors to the payload.
+- **The table and the free list.** The slots live in
+  `[AtomicPtr<[Slot; 512]>; 64]` — 32,768 slots at the ceiling —
+  the table append-only: growth claims the first null entry by CAS
+  (a racing grower that loses frees its own chunk), chains the new
+  slots, and splices the chain onto the free list with one CAS. The
+  free list is a Treiber stack whose head packs
+  `(index << 32) | generation` — the generation makes the ABA of a
+  freed-then-reallocated slot impossible to miss; a push past the
+  ceiling fails the submission eagerly, with the numbers in the
+  message. The wr_id packing is unchanged — `(index << 32) |
+  generation` — so a stale completion from a reused slot is still
+  recognized by its generation.
+- **The tickets.** The connection bound is eager and lock-free too:
+  `Engine::register` returns a `ConnRef { id, load:
+  Arc<ConnLoad { depth, in_flight, live }> }` — the submit checks the
+  id (never registered), the liveness (destroyed), and takes an
+  `in_flight` slot with `fetch_add` (reverted on the spot past the
+  depth, the numbers in the rejection) — and the engine keeps the
+  `ConnLoad` itself for the completion-side decrement and the
+  destroy's live-clear. The ticket is `Clone` (the handle, the
+  session, the reader all hold it), and the depth it reports replaces
+  the engine-wide in-flight limit of the steps before.
+- **What it bought.** The machinery alone (the fakes, no wire):
+  1.48 → **1.27 µs p50** on the dev box. The sequential singles on
+  the cluster moved by −0.04…−0.09 µs p50 — uniformly, all four, and
+  inside the day-to-day noise: on these 2008-era cores an uncontended
+  mutex pair and the phase dance cost about the same, and the
+  sequential path was never the contention case. The traced
+  completion segment (resolve to waiter-done) dropped
+  0.81 → **0.51 µs** — the resolve's lock pair and the waiter's
+  final-poll pair were the segment. And the 16-op concurrent groups,
+  where the waiters' completion polling hammered the slab's lock on
+  every operation: **38.75 → 28.11 µs p50 (read) and
+  33.34 → 27.25 µs (write)** — the contention case the mutex was
+  actually costing.
+- **Adjacent, the same round.** Two teardown bugs the re-measurement
+  round ran into, both fixed and worth the record: the verbs
+  teardown never acknowledged the communication events —
+  "Destruction of an rdma_cm_id will block until related events have
+  been acknowledged" (upstream `rdma_cma.h`) — so an id whose
+  DISCONNECTED landed before its `rdma_destroy_id` (a race the
+  teardown usually won) wedged the engine thread; the connection's
+  drop now drains the channel, bounded, between the disconnect and
+  the destroys. And the benchmark barrier (`GlobalSynch`) could
+  close a round one-sidedly — a node satisfied by a carried view
+  tore its responder down before a still-observing peer ever got an
+  answer, the peer then polling a dead port for its full timeout —
+  the barrier's replies now carry the acknowledgment (the
+  responder's round and the highest request of the poller's it has
+  answered) and the responder lingers past the close so a
+  still-observing peer's poll lands.
 
 ## Tuning for latency
 

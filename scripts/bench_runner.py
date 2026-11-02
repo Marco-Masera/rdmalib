@@ -22,6 +22,7 @@ Usage:
 import argparse
 import asyncio
 import json
+import os
 import re
 import subprocess
 import sys
@@ -45,6 +46,14 @@ async def stream_pipe(pipe, prefix, lines_out: list):
         text = line.decode().rstrip()
         print(f"[{prefix}] {text}", flush=True)
         lines_out.append((prefix, text))
+
+
+def forwarded_env():
+    """RDMALIB_-prefixed host environment, forwarded to the nodes: the
+    library's knobs (RDMALIB_OP_TRACE=1 for the operation timeline)
+    reach the remote processes exactly as the docs promise — `env`
+    assignments ahead of the binary."""
+    return [f"{k}={v}" for k, v in os.environ.items() if k.startswith("RDMALIB_")]
 
 
 async def run_on_node(hostname, remote_cmd, lines_out: list):
@@ -246,6 +255,7 @@ def main():
                     "env",
                     f"{ENV_MY_NODE}={i}",
                     f"{ENV_NODES}={nodes_env}",
+                    *forwarded_env(),
                     remote_binary_path,
                     *bench_args,
                 ]),
