@@ -914,12 +914,17 @@ impl RemoteMemoryProvider {
     /// [`Self::get_remote_mr`] hands out. A repeated call re-requests
     /// both over the open channel, picking up regions the remote
     /// registered since; if that exchange fails, the channel is
-    /// dropped and the next call runs a fresh session.
+    /// dropped and the next call runs a fresh session. (The rkeys a
+    /// re-request picks up are the *current* ones — the fresh rkey of
+    /// a re-granted windowed region travels this path.)
     ///
     /// A fresh session replaces the group's RDMA connection: the
     /// connection's staging pool is dropped with it, and registered
     /// buffers re-register into the new connection's protection
-    /// domain on their next use.
+    /// domain on their next use. [`Self::reconnect`] forces this
+    /// fresh-session path — the recovery for a group whose connection
+    /// has failed, which a healthy channel would otherwise never
+    /// replace.
     pub fn update(&self, group: u32) -> io::Result<()> {
         let mut sessions = self.sessions.borrow_mut();
         let session = sessions.entry(group).or_insert_with(|| GroupSession {
@@ -983,6 +988,29 @@ impl RemoteMemoryProvider {
             let exchange = receive_exchange(&mut channel)?;
             session.channel = Some(channel);
             self.ingest(group, exchange)
+        }
+    }
+
+    /// Forget `group`'s open session, so the next [`Self::update`]
+    /// establishes a fresh one from scratch.
+    ///
+    /// A fresh session is a new metadata exchange *and* a new RDMA
+    /// connection: the group's connection is replaced (the staging
+    /// pool is dropped with it and registered buffers re-register on
+    /// their next use, as in any connection replacement), and the
+    /// remote accepts into the group's protection domain, so the
+    /// group's tuples keep working over the new connection.
+    ///
+    /// The recovery path for a group whose connection has *failed*
+    /// rather than merely gone stale: a queue pair error leaves the
+    /// connection unusable, while a healthy metadata channel would
+    /// make [`Self::update`] merely refresh the tuples over it —
+    /// never touching the connection. Forgetting the channel here
+    /// forces the fresh session that replaces the connection.
+    pub fn reconnect(&self, group: u32) {
+        let mut sessions = self.sessions.borrow_mut();
+        if let Some(session) = sessions.get_mut(&group) {
+            session.channel = None;
         }
     }
 
@@ -1084,11 +1112,24 @@ impl RemoteMemoryProvider {
 }
 
 /// Receive the two-message reply of an exchange: the catalog, then
-/// the tuples.
+/// the tuples. A `ServeError` reply — the remote cannot serve this
+/// exchange — becomes the session's error, carrying the remote's own
+/// reason with it.
 fn receive_exchange(channel: &mut Channel) -> io::Result<(Message, Message)> {
-    let catalog = channel.receive()?;
-    let tuples = channel.receive()?;
+    let catalog = served(channel.receive()?)?;
+    let tuples = served(channel.receive()?)?;
     Ok((catalog, tuples))
+}
+
+/// A reply that is not the remote's refusal to serve; the refusal
+/// becomes the error, with the remote's reason.
+fn served(message: Message) -> io::Result<Message> {
+    match message {
+        Message::ServeError { message } => Err(io::Error::other(format!(
+            "the remote cannot serve this exchange: {message}"
+        ))),
+        exchange => Ok(exchange),
+    }
 }
 
 /// Re-request the catalog and the tuples over an open session.

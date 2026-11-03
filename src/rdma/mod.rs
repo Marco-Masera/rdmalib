@@ -16,7 +16,22 @@
 //!   [`Connection::write`] — and [`Connection::write_inline`], which
 //!   posts small writes straight out of the caller's memory, no
 //!   registration needed, within the budget the device granted the
-//!   connection ([`Connection::inline_cap`]).
+//!   connection ([`Connection::inline_cap`]);
+//! - revocable remote access, via [`ProtectionDomain::alloc_mw`] and
+//!   [`Connection::bind_mw`] / [`Connection::unbind_mw`]: a type 1
+//!   [`MemoryWindow`] binds over registered memory under a fresh
+//!   rkey, and unbinding (a zero-length bind) revokes the grant —
+//!   from the unbind's completion, no access under the previous
+//!   binding is served, in-flight requests included. A later bind
+//!   re-grants under another fresh rkey, usable from any queue pair
+//!   of the domain. The rkey is served only after the bind's
+//!   completion, per the verbs contract.
+//!
+//! Failed completions are classified: a remote access violation
+//! ([`is_remote_access`] — the failure a revoked access reads as)
+//! and a flush ([`is_flushed`] — the failed queue pair's goodbye)
+//! can be told apart from everything else, which is what a
+//! consumer acting on permissions needs.
 //!
 //! Registrations keep their protection domain alive (they hold a
 //! handle of it), so a [`MemoryRegion`] may outlive the connection it
@@ -58,4 +73,7 @@
 
 mod verbs;
 
-pub use verbs::{Connection, Listener, MemoryRegion, ProtectionDomain};
+pub use verbs::{
+    CompletionError, CompletionStatus, Connection, Listener, MemoryRegion, MemoryWindow,
+    ProtectionDomain, is_flushed, is_remote_access,
+};

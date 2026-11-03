@@ -101,6 +101,13 @@ type Owner = Rc<RefCell<Box<dyn Any>>>;
 /// lazily by [`Self::get_shared_mr`], one per (region, group) pair,
 /// and served with the catalog; readers re-request them over their
 /// open session at any time.
+///
+/// A region's grant to a group is a plain registration — forever,
+/// for the provider's lifetime — unless the region is marked
+/// [`Self::serve_through_windows`]: then each group's tuple carries
+/// a memory window's rkey instead, which
+/// [`Self::revoke_region`]/[`Self::grant_region`] can kill or re-grant
+/// with a completion-linearized bind.
 #[derive(Debug)]
 pub struct SharedMemoryRegionProvider {
     addr: SharedMemoryRegionProviderAddr,
@@ -158,11 +165,21 @@ struct RegionInfo {
     elem_align: u32,
     /// `std::any::type_name` of the element type, for diagnostics.
     elem_type: String,
+    /// Whether the region is served to each group through a
+    /// revocable memory window (see
+    /// [`SharedMemoryRegionProvider::serve_through_windows`]) instead
+    /// of a plain registration.
+    windowed: bool,
 }
 
 /// Internal bookkeeping for one group of readers: they share the
-/// group's protection domain, so they share the rkeys of the tuples
-/// created for the group.
+/// group's protection domain, and the group's access *bindings* —
+/// what the tuples served to its readers carry, and what revocation
+/// reaches — live with the domain and the connections. Keeping them
+/// under the groups lock together is what lets a window operation
+/// (a bind posted through one of the connections, its completion
+/// awaited — see [`Shared::bind_through`]) hold exactly one lock:
+/// the queue pair, the window, and the registration are all there.
 #[derive(Debug)]
 struct GroupEntry {
     /// The group's protection domain, created with the group's first
@@ -171,21 +188,71 @@ struct GroupEntry {
     pd: rdma::ProtectionDomain,
     /// The group's accepted reader connections.
     connections: Vec<rdma::Connection>,
+    /// The group's bindings by region id: how each region it can see
+    /// is accessed — a plain registration, or, for a region marked
+    /// windowed, a revocable window. Created lazily by the group's
+    /// tuple requests, kept alive until the provider is dropped.
+    bindings: HashMap<u32, GroupBinding>,
 }
 
 /// The provider state shared with the service and session threads:
-/// the catalog they serve, the groups they accept readers into, and
-/// the tuples they create for those groups.
+/// the catalog they serve and the groups they accept readers into.
+/// Each group carries its own bindings (see [`GroupEntry`]), so no
+/// path nests locks: the catalog is consulted first and released,
+/// then everything group-scoped — tuple creation, window operations —
+/// happens under the groups lock alone.
 #[derive(Debug, Clone)]
 struct Shared {
     /// The region catalog by id.
     catalog: Arc<Mutex<HashMap<u32, RegionInfo>>>,
     /// Reader groups by group id.
     groups: Arc<Mutex<HashMap<u32, GroupEntry>>>,
-    /// Tuples by (region, group): the registration of each region's
-    /// buffer in a group's protection domain, kept alive until the
-    /// provider is dropped.
-    tuples: Arc<Mutex<HashMap<(u32, u32), rdma::MemoryRegion>>>,
+}
+
+/// How one group accesses one region: the grant its served tuple
+/// carries, and what revoking can reach.
+#[derive(Debug)]
+enum GroupBinding {
+    /// A plain registration in the group's protection domain: the
+    /// tuple's rkey is the registration's, granted for the
+    /// provider's lifetime.
+    Registration(rdma::MemoryRegion),
+    /// A type 1 memory window bound over the region's memory: the
+    /// tuple's rkey is the window's — revocable by binding the
+    /// window to zero length (its rkey then fails every access with
+    /// a remote access violation, the classifiable way), re-grantable
+    /// by binding the full range again, each bind rotating to a
+    /// fresh rkey that never revives a previous one.
+    Window {
+        window: rdma::MemoryWindow,
+        /// The registration the window binds over. It only pins the
+        /// memory and scopes the range — its own rkey is never
+        /// served, and its access flags are moot: the binding's
+        /// flags are the window's.
+        backing: rdma::MemoryRegion,
+    },
+}
+
+impl GroupBinding {
+    /// The tuple served for the (region, group): the memory's
+    /// (remote_addr, size, rkey).
+    fn tuple(&self) -> (u64, usize, u32) {
+        match self {
+            GroupBinding::Registration(mr) => mr.tuple(),
+            GroupBinding::Window { window, backing } => {
+                (backing.addr(), backing.size(), window.rkey())
+            }
+        }
+    }
+
+    /// Whether the binding is a window one — the only kind
+    /// [`SharedMemoryRegionProvider::revoke_region`] can act on.
+    fn window(&self) -> Option<(&rdma::MemoryWindow, &rdma::MemoryRegion)> {
+        match self {
+            GroupBinding::Registration(_) => None,
+            GroupBinding::Window { window, backing } => Some((window, backing)),
+        }
+    }
 }
 
 impl SharedMemoryRegionProvider {
@@ -198,7 +265,6 @@ impl SharedMemoryRegionProvider {
             shared: Shared {
                 catalog: Arc::new(Mutex::new(HashMap::new())),
                 groups: Arc::new(Mutex::new(HashMap::new())),
-                tuples: Arc::new(Mutex::new(HashMap::new())),
             },
             owners: RefCell::new(HashMap::new()),
             service: RefCell::new(None),
@@ -316,6 +382,7 @@ impl SharedMemoryRegionProvider {
                 elem_size: size_of::<T>() as u32,
                 elem_align: align_of::<T>() as u32,
                 elem_type: type_name::<T>().to_owned(),
+                windowed: false,
             },
         );
         handle
@@ -342,6 +409,103 @@ impl SharedMemoryRegionProvider {
     pub fn get_shared_mr(&self, id: u32, group: u32) -> io::Result<Option<(u64, usize, u32)>> {
         self.shared.tuple_of(id, group)
     }
+
+    /// Serve region `id`'s memory to each group through a revocable
+    /// memory window instead of a plain registration.
+    ///
+    /// From the marking on, the tuple every session serves for the
+    /// region is its group's *window* rkey: revocable with
+    /// [`Self::revoke_region`] — the window binds to zero length,
+    /// so its rkey fails every access with a remote access violation
+    /// (the failure a consumer can classify) — and re-grantable with
+    /// [`Self::grant_region`], which binds the full range again
+    /// under a fresh rkey the group picks up by re-requesting its
+    /// tuples.
+    ///
+    /// Mark the region before the first session serves it: a group
+    /// whose tuple was already created as a plain registration keeps
+    /// that grant, which marking then refuses loudly. The marking is
+    /// the application's policy — which regions are revocable is not
+    /// the provider's to decide — while the *act* of revoking stays
+    /// an explicit call, never a side effect.
+    pub fn serve_through_windows(&self, id: u32) -> io::Result<()> {
+        // Served bindings live in their groups; an existing one for
+        // this region means a session already materialized its grant
+        // as a plain registration. The check happens before the
+        // marking, so a race between the two is a policy decision
+        // made twice — the marking still refuses.
+        let served = self
+            .shared
+            .groups
+            .lock()
+            .unwrap()
+            .values()
+            .any(|entry| entry.bindings.contains_key(&id));
+        if served {
+            return Err(io::Error::other(format!(
+                "region {id} already has served tuples; mark it windowed before its first session"
+            )));
+        }
+        let mut catalog = self.shared.catalog.lock().unwrap();
+        let Some(info) = catalog.get_mut(&id) else {
+            return Err(io::Error::other(format!(
+                "no region with id {id} is registered"
+            )));
+        };
+        info.windowed = true;
+        Ok(())
+    }
+
+    /// Revoke `group`'s access to region `id`, and report when the
+    /// revocation is *complete*.
+    ///
+    /// Completing means the group's window over the region has bound
+    /// to zero length, and the bind's completion has arrived at this
+    /// node's device: from that point no access under the previous
+    /// binding is served — a request already in flight fails with a
+    /// protection violation, a later one is refused the same way —
+    /// and everything this node writes to the region afterwards is
+    /// invisible through the group's rkey. That completion is the
+    /// confirmation to relay to whoever asked for the revocation.
+    ///
+    /// The binding dies, not the group: the dead rkey keeps being
+    /// served to the group (so its accesses fail classifiably, and
+    /// it can ask for a re-grant), and [`Self::grant_region`]
+    /// re-enables access under a fresh rkey. A group that never got
+    /// a tuple has nothing to revoke — trivially revoked. A region
+    /// served as a plain registration cannot be revoked this way,
+    /// and revoking through a *failed queue pair* cannot take
+    /// effect: the window's bind work request is flushed with the
+    /// queue pair, reported as an error, and the previous binding
+    /// stands — retry through a live connection of the group (its
+    /// next session provides one).
+    pub fn revoke_region(&self, id: u32, group: u32) -> io::Result<()> {
+        self.shared.window_operation(id, group, WindowOperation::Revoke)
+    }
+
+    /// Re-grant `group` access to region `id`: bind its window over
+    /// the full range again, under a fresh rkey.
+    ///
+    /// The grant takes effect at the bind's completion; the group
+    /// picks the new rkey up by re-requesting its tuples (its
+    /// session's `Update`). A group whose tuple has not materialized
+    /// yet is granted lazily by its next tuple request, so this is
+    /// trivially `Ok` for it. As with revoking, the bind needs a
+    /// live connection of the group to post through — a failed one
+    /// flushes the bind and leaves the previous binding standing,
+    /// reported as an error to retry.
+    pub fn grant_region(&self, id: u32, group: u32) -> io::Result<()> {
+        self.shared.window_operation(id, group, WindowOperation::Grant)
+    }
+}
+
+/// Which way a window operation swings the binding it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowOperation {
+    /// Bind to zero length: revoke the grant.
+    Revoke,
+    /// Bind over the full range, fresh rkey: re-grant.
+    Grant,
 }
 
 impl Drop for SharedMemoryRegionProvider {
@@ -354,7 +518,13 @@ impl Drop for SharedMemoryRegionProvider {
         if let Some(service) = self.service.borrow_mut().take() {
             service.stop();
         }
-        self.shared.tuples.lock().unwrap().clear();
+        // The bindings — registrations and windows — are dropped
+        // while the buffers they pin and the groups (whose
+        // protection domains they belong to) are still alive.
+        let mut groups = self.shared.groups.lock().unwrap();
+        for entry in groups.values_mut() {
+            entry.bindings.clear();
+        }
     }
 }
 
@@ -396,47 +566,132 @@ impl Shared {
     /// The (remote_addr, size, rkey) tuple of region `id` for `group`,
     /// created on first request.
     ///
-    /// Creating a tuple registers the region's buffer in the group's
-    /// protection domain: the rkey is a real one, usable by every
-    /// reader of the group, and the registration is kept alive for as
-    /// long as the provider is. Repeated requests for the same region
-    /// and group return the same tuple. The buffer is never touched:
-    /// its address and size were captured at registration time. The
-    /// locks are taken one at a time, never nested.
+    /// Creating the binding registers the region's buffer in the
+    /// group's protection domain — a plain registration, or, for a
+    /// region marked windowed, a type 1 window bound over it — and
+    /// the binding is kept alive for as long as the provider is, so
+    /// repeated requests return its tuple. The buffer is never
+    /// touched: its address and size were captured at registration
+    /// time. The catalog is consulted first and released, then
+    /// everything happens under the groups lock alone — no lock
+    /// nesting anywhere, which is why the bindings live in the
+    /// group entry.
     fn tuple_of(&self, id: u32, group: u32) -> io::Result<Option<(u64, usize, u32)>> {
-        if let Some(mr) = self.tuples.lock().unwrap().get(&(id, group)) {
-            return Ok(Some((mr.addr(), mr.size(), mr.rkey())));
+        let Some(info) = self.catalog.lock().unwrap().get(&id).cloned() else {
+            return Ok(None);
+        };
+        let mut groups = self.groups.lock().unwrap();
+        let Some(entry) = groups.get_mut(&group) else {
+            return Ok(None);
+        };
+        if let Some(binding) = entry.bindings.get(&id) {
+            return Ok(Some(binding.tuple()));
         }
 
-        let Some(pd) = self
-            .groups
-            .lock()
-            .unwrap()
-            .get(&group)
-            .map(|entry| entry.pd.clone())
-        else {
-            return Ok(None);
+        // The backing registration pins the memory and scopes the
+        // range; the access a window grants comes from the binding,
+        // not from it — for a plain registration the registration
+        // itself is the grant. A windowed region's backing must be
+        // registered as a window *target*: a bind demands the
+        // MW_BIND permission of its target (see
+        // `register_window_target`) and is refused otherwise.
+        let binding = if info.windowed {
+            let backing = entry
+                .pd
+                .register_window_target(info.remote_addr, info.size)?;
+            let window = entry.pd.alloc_mw()?;
+            // The bind posts through a live connection of the group
+            // and its completion is awaited inside: the served rkey
+            // is the *bound* one, never a still-pending bind's.
+            entry.bind_through(|conn| {
+                conn.bind_mw(&window, &backing, backing.addr(), backing.size() as u64)
+            })?;
+            GroupBinding::Window { window, backing }
+        } else {
+            GroupBinding::Registration(entry.pd.register_addr(info.remote_addr, info.size)?)
         };
-        let Some((remote_addr, size)) = self
-            .catalog
-            .lock()
-            .unwrap()
-            .get(&id)
-            .map(|entry| (entry.remote_addr, entry.size))
-        else {
-            return Ok(None);
-        };
-
-        let mr = pd.register_addr(remote_addr, size)?;
-        let tuple = (mr.addr(), mr.size(), mr.rkey());
-        self.tuples.lock().unwrap().insert((id, group), mr);
+        let tuple = binding.tuple();
+        entry.bindings.insert(id, binding);
         Ok(Some(tuple))
     }
 
+    /// Run one window operation on the binding of (region, group),
+    /// and report when it took effect.
+    ///
+    /// A group with no binding yet has no access to revoke —
+    /// trivially done — and its grant is left to the lazy binding
+    /// its next tuple request builds. Everything else happens under
+    /// the groups lock: the binding, and the connection its bind
+    /// posts through, are all there (see [`GroupEntry`]).
+    fn window_operation(&self, id: u32, group: u32, op: WindowOperation) -> io::Result<()> {
+        let mut groups = self.groups.lock().unwrap();
+        let Some(entry) = groups.get_mut(&group) else {
+            return Ok(());
+        };
+        let Some(binding) = entry.bindings.get(&id) else {
+            return Ok(());
+        };
+        let Some((window, backing)) = binding.window() else {
+            return Err(io::Error::other(format!(
+                "region {id} is served to group {group} as a plain registration; \
+                 only windowed regions can be revoked or granted"
+            )));
+        };
+        match op {
+            WindowOperation::Revoke => {
+                entry.bind_through(|conn| conn.unbind_mw(window, backing))?;
+            }
+            WindowOperation::Grant => {
+                entry.bind_through(|conn| {
+                    conn.bind_mw(window, backing, backing.addr(), backing.size() as u64)
+                })?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl GroupEntry {
+    /// Post one window operation through one of the group's
+    /// connections, newest first, and return the first success.
+    ///
+    /// A window bind is a work request on a queue pair of the
+    /// window's protection domain, so the group's connections are
+    /// the queue pairs to post through; the newest is the live
+    /// session's, and an older one that has failed flushes the bind
+    /// (reported, the binding stands) — which is what walking to
+    /// the next connection retries. A group with no connection at
+    /// all cannot post: the error says so. The bind's completion is
+    /// awaited inside, a few microseconds, under the caller's lock —
+    /// every other user of the lock holds it for memory operations
+    /// only, so the contention is bounded, and the hold is what
+    /// serializes window operations with group changes, exactly the
+    /// ordering revocation wants.
+    fn bind_through<T>(&self, op: impl Fn(&rdma::Connection) -> io::Result<T>) -> io::Result<T> {
+        let mut failure = None;
+        for connection in self.connections.iter().rev() {
+            match op(connection) {
+                Ok(value) => return Ok(value),
+                Err(e) => failure = Some(e),
+            }
+        }
+        Err(failure.unwrap_or_else(|| {
+            io::Error::other(
+                "the group has no connection to post a window operation through",
+            )
+        }))
+    }
+}
+
+impl Shared {
     /// The catalog and the tuples of `group`, as the two messages of a
     /// session's exchange: every registered region, each with its
-    /// tuple for the group, created lazily here.
-    fn catalog_and_tuples(&self, group: u32) -> (Message, Message) {
+    /// tuple for the group, created lazily here. A tuple that fails
+    /// to materialize is an error — the caller must report it to the
+    /// reader ([`Message::ServeError`]) rather than omit the region,
+    /// which would surface later as a causeless "no tuple" after a
+    /// session that looked successful.
+    fn catalog_and_tuples(&self, group: u32) -> io::Result<(Message, Message)> {
         // A snapshot: the lock is released before tuple creation,
         // which takes the same lock itself.
         let catalog: Vec<(u32, RegionInfo)> = {
@@ -458,7 +713,10 @@ impl Shared {
                 elem_align: info.elem_align,
                 elem_type: info.elem_type,
             });
-            if let Ok(Some((remote_addr, size, rkey))) = self.tuple_of(id, group) {
+            // `Ok(None)` — the region or the group unknown — is the
+            // only legitimate skip; any failure to create a tuple
+            // fails the exchange.
+            if let Some((remote_addr, size, rkey)) = self.tuple_of(id, group)? {
                 tuples.push(TupleDesc {
                     region_id: id,
                     remote_addr,
@@ -467,7 +725,7 @@ impl Shared {
                 });
             }
         }
-        (Message::Metadata { regions }, Message::Tuples { group, tuples })
+        Ok((Message::Metadata { regions }, Message::Tuples { group, tuples }))
     }
 }
 
@@ -588,11 +846,24 @@ impl Service {
             .or_insert_with(|| GroupEntry {
                 pd: connection.protection_domain(),
                 connections: Vec::new(),
+                bindings: HashMap::new(),
             })
             .connections
             .push(connection);
 
-        let (catalog, tuples) = self.shared.catalog_and_tuples(group);
+        let (catalog, tuples) = match self.shared.catalog_and_tuples(group) {
+            Ok(exchange) => exchange,
+            Err(e) => {
+                // Say why, then close: the reader turns this into its
+                // session error, with the cause, instead of an
+                // unexplained end of file after a handshake that
+                // looked fine.
+                let _ = channel.send(&Message::ServeError {
+                    message: e.to_string(),
+                });
+                return Err(e);
+            }
+        };
         channel.send(&catalog)?;
         channel.send(&tuples)?;
 
@@ -625,7 +896,19 @@ impl SessionThread {
     fn wait_for_updates(mut self) {
         while !self.shutdown.load(Ordering::Relaxed) {
             let (catalog, tuples) = match self.channel.receive() {
-                Ok(Message::Update) => self.shared.catalog_and_tuples(self.group),
+                Ok(Message::Update) => match self.shared.catalog_and_tuples(self.group) {
+                    Ok(exchange) => exchange,
+                    Err(e) => {
+                        // The same contract as the handshake: report
+                        // why this update cannot be served, then
+                        // close — the reader's next update opens a
+                        // fresh session.
+                        let _ = self.channel.send(&Message::ServeError {
+                            message: e.to_string(),
+                        });
+                        return;
+                    }
+                },
                 Ok(_) | Err(_) => return,
             };
             if self.channel.send(&catalog).is_err() || self.channel.send(&tuples).is_err() {

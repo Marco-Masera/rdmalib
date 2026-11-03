@@ -41,6 +41,38 @@ let tests = region.read_typed::<Test>(0, 3)?; // [Test { v: 1 }, Test { v: 2 }, 
 assert_eq!(tests.iter().map(|t| t.v).collect::<Vec<_>>(), vec![1, 2, 3]);
 ```
 
+## Revocable access
+
+By default a region's grant to a group is a plain registration, live
+for the provider's lifetime. A region can instead be served through
+**memory windows** — one type-1 window per group, bound over the
+region's memory, revocable and re-grantable:
+
+```rust
+owner.serve_through_windows(handle.id())?; // before any session serves the region
+...
+// Revoke group 5's access: returns only after the window's
+// zero-length bind *completed* at the device — from that point no
+// access under the previous binding is served, a request already
+// in flight included; everything written afterwards is invisible
+// through group 5's rkey.
+owner.revoke_region(handle.id(), 5)?;
+...
+// Re-grant: the window binds over the full range again, under a
+// fresh rkey (the old one never revives) the group picks up by
+// re-requesting its tuples (reader.update).
+owner.grant_region(handle.id(), 5)?;
+```
+
+A revoked group keeps being served its — now dead — rkey, so its
+operations fail with a remote access violation a consumer can
+classify (`rdmalib::is_remote_access`; the flush that follows a
+failed queue pair is `rdmalib::is_flushed`) instead of the region
+vanishing from its catalog. A reader whose connection died (a
+revocation kills the queue pair) re-establishes it with
+`reader.reconnect(group)`: the next `update` runs a fresh session,
+replacing the connection inside the same group.
+
 ## Word-level alignment
 
 RDMA one-sided accesses are **atomic at the machine-word level** when

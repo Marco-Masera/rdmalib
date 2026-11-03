@@ -109,6 +109,41 @@ fn typed_regions_serve_tuples_like_byte_regions() {
 }
 
 #[test]
+fn windowed_regions_need_a_real_region() {
+    let provider = provider();
+
+    // The marking names a region that must exist.
+    assert!(provider.serve_through_windows(99).is_err());
+}
+
+#[test]
+fn windowed_regions_serve_nothing_without_a_group() {
+    let provider = provider();
+    let handle = provider.register(SharedMemoryRegionMetadata::new("secret", vec![0u8; 512]));
+    provider.serve_through_windows(handle.id()).unwrap();
+
+    // No reader has been accepted into group 0, so no group — and no
+    // binding — exists: the windowed path never posts a bind. (The
+    // bind itself needs the group's connection, so it is exercised
+    // only on hardware.)
+    assert!(provider.get_shared_mr(handle.id(), 0).unwrap().is_none());
+}
+
+#[test]
+fn revoking_without_a_grant_is_trivially_done() {
+    let provider = provider();
+    let handle = provider.register(SharedMemoryRegionMetadata::new("secret", vec![0u8; 512]));
+    provider.serve_through_windows(handle.id()).unwrap();
+
+    // A group that never materialized a binding has no access at
+    // all: revoking is a no-op, granting is left to the lazy binding
+    // its next tuple request builds.
+    provider.revoke_region(handle.id(), 0).unwrap();
+    provider.grant_region(handle.id(), 0).unwrap();
+    assert!(provider.get_shared_mr(handle.id(), 0).unwrap().is_none());
+}
+
+#[test]
 #[should_panic(expected = "zero-sized")]
 fn zero_sized_elements_are_rejected() {
     #[derive(Clone, Copy)]

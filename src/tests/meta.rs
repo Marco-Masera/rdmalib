@@ -62,6 +62,12 @@ fn every_message_round_trips() {
             rkey: 0xAB,
         }],
     });
+    round_trip(Message::ServeError {
+        message: "the bind was refused by the device".into(),
+    });
+    round_trip(Message::ServeError {
+        message: String::new(),
+    });
 }
 
 #[test]
@@ -94,6 +100,13 @@ fn frame_layout_is_pinned() {
             },
             9,
             6,
+        ),
+        (
+            Message::ServeError {
+                message: String::new(),
+            },
+            5,
+            7,
         ),
     ];
     for (msg, len, ty) in cases {

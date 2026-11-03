@@ -46,6 +46,7 @@ const MSG_WANT_GROUP: u8 = 3;
 const MSG_UPDATE: u8 = 4;
 const MSG_METADATA: u8 = 5;
 const MSG_TUPLES: u8 = 6;
+const MSG_SERVE_ERROR: u8 = 7;
 
 /// One message of the metadata exchange.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +77,16 @@ pub(crate) enum Message {
     Tuples {
         group: u32,
         tuples: Vec<TupleDesc>,
+    },
+    /// Provider → reader: why an exchange (a session's first, or an
+    /// update's) could not be served — a region whose tuple failed
+    /// to materialize (e.g. a windowed region whose window bind the
+    /// device refuses), never a region quietly missing from the
+    /// tuples. The provider closes the channel right after sending
+    /// it, so the reader surfaces the message as its session
+    /// error instead of an unexplained end of file.
+    ServeError {
+        message: String,
     },
 }
 
@@ -156,6 +167,10 @@ impl Message {
                 }
                 MSG_TUPLES
             }
+            Message::ServeError { message } => {
+                put_str(&mut payload, message);
+                MSG_SERVE_ERROR
+            }
         };
         let mut frame = Vec::with_capacity(5 + payload.len());
         put_u32(&mut frame, 1 + payload.len() as u32);
@@ -222,6 +237,9 @@ pub(crate) fn decode(ty: u8, payload: &[u8]) -> io::Result<Message> {
             }
             Message::Tuples { group, tuples }
         }
+        MSG_SERVE_ERROR => Message::ServeError {
+            message: r.string()?,
+        },
         _ => return Err(bad(format!("unknown message type {ty}"))),
     };
     r.done()?;
