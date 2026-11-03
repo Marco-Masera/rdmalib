@@ -181,11 +181,14 @@ const SYNCH_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// The protocol is a distributed clock. `synch` raises this node's
 /// clock, then repeatedly exchanges clocks with the other nodes — a
-/// poll carries the poller's clock, the reply the polled node's —
-/// until every peer has been heard from with a clock at least this
-/// high. One exchange informs both sides, and a node can only leave a
-/// barrier through exchanges that already left its own clock with
-/// every peer: no peer ever still needs to hear from a node that has
+/// poll carries the poller's identity and clock, the reply the
+/// polled node's — until every peer has been heard from with a clock
+/// at least this high — heard while the round was running: each
+/// round resets what it knows of the peers (see [`Self::synch`]),
+/// so a clock recorded in an earlier round cannot satisfy it. One
+/// exchange informs both sides, and a node can only leave a barrier
+/// through exchanges that already left its own clock with every
+/// peer: no peer ever still needs to hear from a node that has
 /// left. That is what makes it safe to listen only while inside
 /// `synch` itself — a refused connection is not an error, only a node
 /// that has not entered the barrier yet.
@@ -295,6 +298,18 @@ impl GlobalSynch {
         if self.peers.is_empty() {
             return Ok(());
         }
+        // Fresh evidence per round: a clock heard in an earlier round
+        // must not satisfy this one. A round satisfied purely by
+        // values recorded early — a momentarily ahead peer answers a
+        // poll with its future clock — would let this node leave
+        // without any exchange of the round, and a peer that never
+        // saw the round would then poll the departed node forever.
+        // Starting from `round - 1` keeps each round a fresh
+        // exchange with every peer, which is what the leaving
+        // invariant above is made of.
+        for known in &mut self.known_clocks {
+            *known = round - 1;
+        }
         let listener = TcpListener::bind(SocketAddrV4::new(self.my_ip, self.port))?;
         listener.set_nonblocking(true)?;
 
@@ -387,34 +402,51 @@ impl GlobalSynch {
         std::process::exit(1)
     }
 
-    /// Poll one peer: send this node's clock and read the peer's.
+    /// Poll one peer: send this node's identity and clock, and read
+    /// the peer's clock.
+    ///
+    /// The identity travels in the payload because the connection
+    /// does not carry it: a poller does not bind its source address,
+    /// and an unbound loopback connect presents as 127.0.0.1
+    /// whichever 127.x node it comes from. Without the payload, the
+    /// responder could never tell who is asking, every inbound poll
+    /// would go unattributed (the bookkeeping in [`answer`] matches
+    /// peers by address), and the barrier would silently degrade to
+    /// one-directional polling — where a node finishing its last
+    /// round can exit between a peer's polls, leaving that peer
+    /// waiting forever.
     fn poll(&self, peer: Ipv4Addr) -> io::Result<u64> {
         let addr = SocketAddr::V4(SocketAddrV4::new(peer, self.port));
         let mut stream = TcpStream::connect_timeout(&addr, SYNCH_IO_TIMEOUT)?;
         stream.set_read_timeout(Some(SYNCH_IO_TIMEOUT))?;
         stream.set_write_timeout(Some(SYNCH_IO_TIMEOUT))?;
-        stream.write_all(&self.clock.to_le_bytes())?;
+        let mut request = self.clock.to_le_bytes().to_vec();
+        request.extend_from_slice(&self.my_ip.octets());
+        stream.write_all(&request)?;
         let mut reply = [0u8; 8];
         stream.read_exact(&mut reply)?;
         Ok(u64::from_le_bytes(reply))
     }
 }
 
-/// Answer one poll: read the poller's clock, report it back to the
-/// node's own bookkeeping, and send the node's clock in return.
+/// Answer one poll: read the poller's identity and clock, report
+/// both back to the node's own bookkeeping, and send the node's clock
+/// in return.
 ///
 /// Runs on the responder thread of one [`GlobalSynch::synch`] call;
-/// `my_clock` is the clock fixed for that round. The poller's clock is
-/// reported before the reply is sent, so a poller that has read a
-/// reply can rely on its target having already heard its own clock.
+/// `my_clock` is the clock fixed for that round. The identity comes
+/// from the payload, never the connection's source address (see
+/// [`GlobalSynch::poll`]). The poller's clock is reported before the
+/// reply is sent, so a poller that has read a reply can rely on its
+/// target having already heard its own clock.
 fn answer(mut stream: TcpStream, my_clock: u64, seen: &mpsc::Sender<(IpAddr, u64)>) -> io::Result<()> {
     stream.set_read_timeout(Some(SYNCH_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(SYNCH_IO_TIMEOUT))?;
-    let mut request = [0u8; 8];
+    let mut request = [0u8; 12];
     stream.read_exact(&mut request)?;
-    let their_clock = u64::from_le_bytes(request);
-    let peer_ip = stream.peer_addr()?.ip();
-    let _ = seen.send((peer_ip, their_clock));
+    let their_clock = u64::from_le_bytes(request[..8].try_into().unwrap());
+    let peer_ip = Ipv4Addr::new(request[8], request[9], request[10], request[11]);
+    let _ = seen.send((IpAddr::V4(peer_ip), their_clock));
     let reply = my_clock.to_le_bytes();
     stream.write_all(&reply)
 }

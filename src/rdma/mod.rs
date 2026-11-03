@@ -13,7 +13,16 @@
 //!   and produces the (remote_addr, size, rkey) tuple remote readers
 //!   need;
 //! - one-sided reads and writes, via [`Connection::read`] and
-//!   [`Connection::write`].
+//!   [`Connection::write`] — and [`Connection::write_inline`], which
+//!   posts small writes straight out of the caller's memory, no
+//!   registration needed, within the budget the device granted the
+//!   connection ([`Connection::inline_cap`]).
+//!
+//! Registrations keep their protection domain alive (they hold a
+//! handle of it), so a [`MemoryRegion`] may outlive the connection it
+//! was registered through — its keys keep working through the
+//! domain's other connections, and its deregistration never races
+//! the domain's destruction.
 //!
 //! The implementation is technology-specific and confined to a single
 //! module; the current one is built on libibverbs and rdma_cm.

@@ -3,8 +3,8 @@
 //! A shared region's bytes are written by remote machines, so the
 //! library can only hand them back as values of a type `T` when every
 //! bit pattern is a valid `T`. [`RemoteSafe`] is the (unsafe,
-//! user-asserted) marker for such types; [`impl_remote_safe!`] and
-//! [`zeroed_vec`] are the small pieces of machinery around it.
+//! user-asserted) marker for such types, and [`impl_remote_safe!`]
+//! is the small piece of machinery around it.
 
 /// A type whose values can live in a shared memory region: **every
 /// bit pattern of `size_of::<T>()` bytes is a valid `T`**.
@@ -65,17 +65,3 @@ crate::impl_remote_safe!(
 // Arrays are contiguous runs of their element: any bit pattern valid
 // for the element is valid for the array.
 unsafe impl<T: RemoteSafe, const N: usize> RemoteSafe for [T; N] {}
-
-/// A `Vec` of `len` all-zero `T`s, for reads that fill a typed buffer.
-pub(crate) fn zeroed_vec<T: RemoteSafe>(len: usize) -> Vec<T> {
-    let mut vec: Vec<T> = Vec::with_capacity(len);
-    // SAFETY: `write_bytes` initializes the `len` elements the
-    // allocation has capacity for, and all-zero bits are a valid `T`
-    // by the `RemoteSafe` contract, so `set_len` only exposes valid
-    // values.
-    unsafe {
-        std::ptr::write_bytes(vec.as_mut_ptr(), 0, len);
-        vec.set_len(len);
-    }
-    vec
-}

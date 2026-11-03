@@ -1,8 +1,8 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
 
-use crate::readers::{CachedRegion, GroupConnection};
+use crate::readers::{CachedRegion, GroupConnection, GroupSession, RegisteredBuffer};
 use crate::*;
 
 fn metadata(name: &str, id: u32, size: usize) -> RemoteMemoryRegionMetadata {
@@ -272,4 +272,132 @@ fn typed_write_mismatch_with_the_registered_layout_is_rejected() {
         region.write_typed::<u64>(0, &[0u64; 1]).unwrap_err().kind(),
         io::ErrorKind::InvalidInput
     );
+}
+
+#[test]
+fn staging_capacity_is_configurable() {
+    // The default: 1 MiB.
+    let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
+    assert_eq!(provider.staging_capacity(), 1 << 20);
+
+    // The builder tunes it...
+    let tuned =
+        RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default()).with_staging_capacity(4 << 20);
+    assert_eq!(tuned.staging_capacity(), 4 << 20);
+    // ...and degenerate values are clamped to what a pool can be:
+    // non-empty, and addressable by one RDMA operation.
+    assert_eq!(
+        RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default())
+            .with_staging_capacity(0)
+            .staging_capacity(),
+        1
+    );
+
+    // A live session's slot follows a later change: its capacity is
+    // updated and its pool dropped, to be re-created lazily at the
+    // new size.
+    tuned.sessions.borrow_mut().insert(
+        0,
+        GroupSession {
+            channel: None,
+            connection: Rc::new(RefCell::new(GroupConnection::with_capacity(4096))),
+        },
+    );
+    tuned.set_staging_capacity(8192);
+    let slot = Rc::clone(&tuned.sessions.borrow().get(&0).unwrap().connection);
+    let slot = slot.borrow();
+    assert_eq!(slot.capacity, 8192);
+    assert!(slot.staging.is_none());
+}
+
+#[test]
+fn register_buffer_needs_a_session_and_a_connection() {
+    let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
+
+    // No session for the group yet: an update is needed first.
+    let err = provider.register_buffer(0, vec![0u8; 8]).unwrap_err();
+    assert_ne!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("update"), "{err}");
+
+    // A session without a connection (no rendezvous has run): the
+    // same story.
+    provider.sessions.borrow_mut().insert(
+        0,
+        GroupSession {
+            channel: None,
+            connection: Rc::new(RefCell::new(GroupConnection::empty())),
+        },
+    );
+    let err = provider.register_buffer(0, vec![0u8; 8]).unwrap_err();
+    assert_ne!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("update"), "{err}");
+
+    // An empty buffer is invalid input, rejected before any of that.
+    assert_eq!(
+        provider.register_buffer(0, Vec::new()).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn registered_buffer_operations_check_before_touching_the_device() {
+    // A region shared as u64s and a matching registered buffer —
+    // with no registration made (none can be made here): everything
+    // the checks reject never reaches the connection, and everything
+    // they accept fails for want of it.
+    let u64_region = region(8, 8, "u64");
+    let mut buffer = RegisteredBuffer {
+        group: 0,
+        connection: Rc::new(RefCell::new(GroupConnection::empty())),
+        generation: Cell::new(0),
+        mr: RefCell::new(None),
+        buf: vec![0u64; 4],
+    };
+
+    // More elements than the buffer holds.
+    assert_eq!(
+        u64_region
+            .read_into_registered(0, 5, &mut buffer)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    // Beyond the region's end: 2 elements at element offset 511.
+    assert_eq!(
+        u64_region
+            .read_into_registered(511, 2, &mut buffer)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    // A mismatched element layout, rejected like the typed reads.
+    let u32_region = region(4, 4, "u32");
+    assert_eq!(
+        u32_region
+            .read_into_registered(0, 2, &mut buffer)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    // The buffer belongs to another group.
+    let mut other_group_region = region(8, 8, "u64");
+    other_group_region.group = 1;
+    assert_eq!(
+        other_group_region
+            .read_into_registered(0, 2, &mut buffer)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+
+    // In bounds, matching layout, right group: the failure is for
+    // want of the connection, not bad input.
+    let err = u64_region
+        .read_into_registered(0, 4, &mut buffer)
+        .unwrap_err();
+    assert_ne!(err.kind(), io::ErrorKind::InvalidInput);
+    let err = u64_region
+        .write_from_registered(0, 4, &buffer)
+        .unwrap_err();
+    assert_ne!(err.kind(), io::ErrorKind::InvalidInput);
 }

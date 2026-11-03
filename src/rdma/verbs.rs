@@ -44,7 +44,36 @@ const AF_INET: u16 = 2;
 const IBV_QPT_RC: c_int = 2;
 const IBV_WR_RDMA_WRITE: c_int = 0;
 const IBV_WR_RDMA_READ: c_int = 4;
+// Send flags (from `enum ibv_send_flags`): every work request is
+// signaled, and small writes may carry their payload inline — the
+// device copies it out of the caller's memory while the request is
+// posted, so it needs no registration (its `lkey` is ignored).
 const IBV_SEND_SIGNALED: c_uint = 1 << 1;
+const IBV_SEND_INLINE: c_uint = 1 << 3;
+
+/// Inline budgets a new queue pair asks for, most preferred first.
+///
+/// The verbs create path writes the budget the device actually
+/// granted back into the queue pair attributes (`cap.max_inline_data`
+/// is an in/out parameter: both libibverbs' `ibv_cmd_create_qp` and
+/// the providers — e.g. mlx5's `mlx5_calc_sq_size` — update it on
+/// return), so the first candidate the device accepts settles the
+/// connection's [`Connection::inline_cap`] regardless of clamping. A
+/// device that rejects an oversized request is stepped down; 0 is the
+/// verbs default every device accepts, so a failure there is a real
+/// error.
+///
+/// The top candidate is the mlx5 ceiling, the largest budget its
+/// queue pairs are granted at all: `mlx5_calc_send_wqe` fits a send
+/// work request into the device's 976-byte `max_sq_desc_sz` in
+/// 64-byte blocks, so asking for 924 bytes builds a 960-byte work
+/// request — the largest that fits — and grants 924 back (960 minus
+/// the 36 bytes of control, remote-address, and inline segment
+/// headers). Asking for 220 grants exactly 220; a top candidate
+/// below the device ceiling reads back normally, so the shortfall
+/// only shows as the sizes between the two taking the staging pool
+/// instead of riding inline.
+const INLINE_CANDIDATES: &[u32] = &[924, 220, 96, 0];
 
 // MR access flags (from `infiniband/verbs.h`): the remote reader may
 // read and write, and future atomic operations are allowed.
@@ -451,13 +480,19 @@ fn wait_event(channel: *mut RdmaEventChannel, expected: c_int, step: &str) -> io
 /// operations, such as the destination buffer of a read or the source
 /// of a write.
 ///
-/// Dropping the region deregisters it. Safety contracts: the buffer
-/// must outlive the region without moving or being resized, and the
-/// region must be dropped before its connection.
+/// Dropping the region deregisters it. Safety contract: the buffer
+/// must outlive the region without moving or being resized. The
+/// region keeps its protection domain alive (it holds a handle to
+/// it), so it may outlive the connection it was registered through —
+/// its keys then keep working through the domain's remaining
+/// connections; registering again is required only once the
+/// connection's domain is replaced.
 pub struct MemoryRegion {
     mr: *mut IbvMr,
-    /// The connection's protection domain, checked by read operations.
-    pd: *mut IbvPd,
+    /// The domain the memory is registered in; checked by the
+    /// operations, and kept alive until this handle is dropped, so
+    /// the deregistration below never races the domain's destruction.
+    pd: ProtectionDomain,
     addr: u64,
     size: usize,
     lkey: u32,
@@ -524,9 +559,11 @@ impl fmt::Debug for MemoryRegion {
 /// device's listener into it fails.
 ///
 /// Cloning a handle shares the domain; it is destroyed once the last
-/// handle, connection, and registration are gone. Safety contract:
-/// registrations ([`MemoryRegion`]) must be dropped before the last
-/// handle.
+/// handle, connection, and registration are gone. Registrations
+/// ([`MemoryRegion`]) hold handles of it, so they keep the domain
+/// alive until they are dropped — their deregistration always
+/// happens while the domain is still there, whatever the drop order
+/// of connections and regions around them.
 #[derive(Clone)]
 pub struct ProtectionDomain {
     inner: Arc<PdInner>,
@@ -596,7 +633,7 @@ impl ProtectionDomain {
         let (lkey, rkey) = unsafe { ((*mr).lkey, (*mr).rkey) };
         Ok(MemoryRegion {
             mr,
-            pd: self.inner.pd,
+            pd: self.clone(),
             addr,
             size,
             lkey,
@@ -655,6 +692,10 @@ pub struct Connection {
     /// Event channel owned by this connection; accepted connections
     /// share the listener's channel and leave this null.
     event_channel: *mut RdmaEventChannel,
+    /// The inline budget the device granted the queue pair: writes of
+    /// at most this many bytes can be posted with [`IBV_SEND_INLINE`],
+    /// straight from the caller's memory.
+    inline_cap: u32,
     /// Work request ids, to match completions in [`Connection::read`].
     next_wr_id: Cell<u64>,
 }
@@ -680,6 +721,7 @@ impl Connection {
             cq: std::ptr::null_mut(),
             pd: None,
             event_channel,
+            inline_cap: 0,
             next_wr_id: Cell::new(0),
         };
         conn.connect_to(&mut dst)?;
@@ -737,7 +779,10 @@ impl Connection {
         self.cq = cq;
 
         // A reliable connection signaling every send, like the C
-        // library: each read completion is then always reported.
+        // library: each read completion is then always reported. The
+        // inline budget is probed: the first candidate the device
+        // accepts wins, and the budget the device granted is written
+        // back into the attributes (see [`INLINE_CANDIDATES`]).
         let mut attr = IbvQpInitAttr {
             qp_context: std::ptr::null_mut(),
             send_cq: cq,
@@ -753,10 +798,19 @@ impl Connection {
             qp_type: IBV_QPT_RC,
             sq_sig_all: 1,
         };
-        check(
-            "rdma_create_qp",
-            unsafe { rdma_create_qp(self.id, pd.raw(), &mut attr) },
-        )?;
+        for &candidate in INLINE_CANDIDATES {
+            attr.cap.max_inline_data = candidate;
+            let ret = unsafe { rdma_create_qp(self.id, pd.raw(), &mut attr) };
+            if ret == 0 {
+                self.inline_cap = attr.cap.max_inline_data;
+                break;
+            }
+            if candidate == 0 {
+                // 0 is the verbs default every device accepts: the
+                // failure is a real create error, not a probe miss.
+                check("rdma_create_qp", ret)?;
+            }
+        }
         self.pd = Some(pd);
         Ok(())
     }
@@ -819,6 +873,65 @@ impl Connection {
         self.one_sided("write", IBV_WR_RDMA_WRITE, mr, remote_addr, rkey, len)
     }
 
+    /// The inline budget the device granted this connection's queue
+    /// pair, in bytes.
+    ///
+    /// Writes of at most this many bytes can be posted with
+    /// [`Self::write_inline`], straight out of the caller's memory.
+    pub fn inline_cap(&self) -> usize {
+        self.inline_cap as usize
+    }
+
+    /// Write `len` bytes of unregistered memory at `local_addr` to
+    /// `remote_addr` of the remote machine, accessed with `rkey`.
+    ///
+    /// The payload is inlined into the work request: the device
+    /// copies it out of the caller's memory while the request is
+    /// being posted, so the memory needs no registration (the
+    /// scatter entry's `lkey` is ignored when inline). `len` must not
+    /// exceed the connection's inline budget ([`Self::inline_cap`]) —
+    /// larger writes belong on [`Self::write`], with a registered
+    /// buffer.
+    ///
+    /// Synchronous like [`Self::read`] and [`Self::write`]. The
+    /// remote memory must be registered for remote writes — every
+    /// region the high-level providers share is.
+    pub fn write_inline(
+        &self,
+        local_addr: u64,
+        remote_addr: u64,
+        rkey: u32,
+        len: usize,
+    ) -> io::Result<()> {
+        if len == 0 {
+            return Err(invalid("cannot write zero bytes"));
+        }
+        if len > self.inline_cap as usize {
+            return Err(invalid(format!(
+                "inline write of {len} bytes exceeds the inline budget of {} bytes",
+                self.inline_cap
+            )));
+        }
+        let mut sge = IbvSge {
+            addr: local_addr,
+            length: len as u32,
+            lkey: 0,
+        };
+        let mut send_wr = IbvSendWr {
+            wr_id: self.next_wr_id.replace(self.next_wr_id.get() + 1),
+            next: std::ptr::null_mut(),
+            sg_list: &mut sge,
+            num_sge: 1,
+            opcode: IBV_WR_RDMA_WRITE,
+            send_flags: IBV_SEND_SIGNALED | IBV_SEND_INLINE,
+            imm_data: 0,
+            wr: SendWrOp {
+                rdma: IbvRdmaWr { remote_addr, rkey },
+            },
+        };
+        self.post_and_wait("write", &mut send_wr)
+    }
+
     /// Post one one-sided RDMA operation and wait for its completion.
     ///
     /// `opcode` picks the operation ([`IBV_WR_RDMA_READ`] or
@@ -839,6 +952,11 @@ impl Connection {
         if len == 0 {
             return Err(invalid(format!("cannot {op} zero bytes")));
         }
+        if len > u32::MAX as usize {
+            return Err(invalid(format!(
+                "{op} of {len} bytes exceeds the 4 GiB addressable by a single operation; split it"
+            )));
+        }
         if len > mr.size {
             return Err(invalid(format!(
                 "{op} of {len} bytes exceeds the registered region of {} bytes",
@@ -846,20 +964,19 @@ impl Connection {
             )));
         }
         let pd = self.pd.as_ref().expect("the connection is established");
-        if mr.pd != pd.raw() {
+        if !Arc::ptr_eq(&mr.pd.inner, &pd.inner) {
             return Err(invalid(
                 "the memory region is registered in another protection domain",
             ));
         }
 
-        let wr_id = self.next_wr_id.replace(self.next_wr_id.get() + 1);
         let mut sge = IbvSge {
             addr: mr.addr,
             length: len as u32,
             lkey: mr.lkey,
         };
         let mut send_wr = IbvSendWr {
-            wr_id,
+            wr_id: self.next_wr_id.replace(self.next_wr_id.get() + 1),
             next: std::ptr::null_mut(),
             sg_list: &mut sge,
             num_sge: 1,
@@ -870,28 +987,36 @@ impl Connection {
                 rdma: IbvRdmaWr { remote_addr, rkey },
             },
         };
-        let mut bad_wr: *mut IbvSendWr = std::ptr::null_mut();
+        self.post_and_wait(op, &mut send_wr)
+    }
+
+    /// Post one work request and wait for its completion.
+    ///
+    /// The request is identified by its work request id, which stale
+    /// completions (e.g. left by an operation that timed out) do not
+    /// match; those are skipped.
+    fn post_and_wait(&self, op: &str, wr: &mut IbvSendWr) -> io::Result<()> {
         // ibv_post_send is a static inline call in verbs.h, dispatched
         // through the device's command table.
+        let mut bad_wr: *mut IbvSendWr = std::ptr::null_mut();
         let qp = unsafe { (*self.id).qp };
         let post_send = unsafe { (*(*qp).context).ops.post_send };
-        check(
-            "ibv_post_send",
-            unsafe { post_send(qp, &mut send_wr, &mut bad_wr) },
-        )?;
+        check("ibv_post_send", unsafe { post_send(qp, wr, &mut bad_wr) })?;
 
-        // Wait for this operation's completion, skipping stale ones
-        // (e.g. left by an operation that timed out). ibv_poll_cq is a
-        // static inline call in verbs.h, dispatched like ibv_post_send.
+        // Spin on the completion queue: polling is user-space work on
+        // every verbs device, which is what the latency wants.
+        // ibv_poll_cq is a static inline call in verbs.h, dispatched
+        // like ibv_post_send.
         let poll_cq = unsafe { (*(*self.cq).context).ops.poll_cq };
         let deadline = Instant::now() + POLL_TIMEOUT;
         let mut wc: IbvWc = unsafe { std::mem::zeroed() };
+        let mut polls: u32 = 0;
         loop {
             let ret = unsafe { poll_cq(self.cq, 1, &mut wc) };
             if ret < 0 {
                 check("ibv_poll_cq", -ret)?;
             }
-            if ret == 1 && wc.wr_id == wr_id {
+            if ret == 1 && wc.wr_id == wr.wr_id {
                 if wc.status != IBV_WC_SUCCESS {
                     return Err(io::Error::other(format!(
                         "RDMA {op} failed: {} (vendor error {})",
@@ -901,7 +1026,12 @@ impl Connection {
                 }
                 return Ok(());
             }
-            if Instant::now() >= deadline {
+            // Reading the clock is a vDSO call next to the few
+            // instructions of a poll, so the deadline is only checked
+            // every so often; waiting for it never delays a
+            // completion — the queue is polled on every iteration.
+            polls = polls.wrapping_add(1);
+            if polls & 127 == 0 && Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("timed out waiting for the RDMA {op} completion"),
@@ -937,8 +1067,12 @@ impl Drop for Connection {
 
 impl fmt::Debug for Connection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The raw identifier is enough to tell connections apart.
-        f.debug_struct("Connection").field("id", &self.id).finish()
+        // The raw identifier is enough to tell connections apart; the
+        // inline budget says what small writes can do through it.
+        f.debug_struct("Connection")
+            .field("id", &self.id)
+            .field("inline_cap", &self.inline_cap)
+            .finish()
     }
 }
 
@@ -1037,6 +1171,7 @@ impl Listener {
             // The child id shares this listener's event channel, which
             // this connection must not destroy.
             event_channel: std::ptr::null_mut(),
+            inline_cap: 0,
             next_wr_id: Cell::new(0),
         };
 
