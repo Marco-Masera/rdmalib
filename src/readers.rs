@@ -967,9 +967,13 @@ impl RemoteMemoryProvider {
 
             // The rendezvous: the remote, having read the group join,
             // is accepting into the group's protection domain — this
-            // connection, which the group's regions read through.
-            let connection =
-                rdma::Connection::connect((self.addr.address.as_str(), self.addr.rdma_port))?;
+            // connection, which the group's regions read through. The
+            // group announced in the connect's private data is what
+            // the remote matches its accept against.
+            let connection = rdma::Connection::connect_group(
+                (self.addr.address.as_str(), self.addr.rdma_port),
+                group,
+            )?;
             {
                 let mut slot = session.connection.borrow_mut();
                 // The new connection has a protection domain of its

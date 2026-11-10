@@ -24,7 +24,7 @@ pub use providers::{
     SharedMemoryRegionHandle, SharedMemoryRegionMetadata, SharedMemoryRegionProvider,
     SharedMemoryRegionProviderAddr,
 };
-pub use rdma::{is_flushed, is_remote_access};
+pub use rdma::{is_flushed, is_remote_access, is_remote_op};
 pub use readers::{
     RegisteredBuffer, RemoteMemoryProvider, RemoteMemoryProviderAddr, RemoteMemoryRegion,
     RemoteMemoryRegionMetadata,

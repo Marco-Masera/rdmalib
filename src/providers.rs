@@ -19,6 +19,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::mem::{align_of, size_of};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,6 +28,7 @@ use std::time::Duration;
 
 use crate::meta::{Channel, Message, RegionDesc, TupleDesc, PROTOCOL_VERSION};
 use crate::rdma;
+use crate::rdma::is_flushed;
 use crate::RemoteSafe;
 
 /// A memory region to be shared with remote machines, as raw bytes.
@@ -288,12 +290,16 @@ impl SharedMemoryRegionProvider {
     ///
     /// The service runs one rendezvous at a time; each open session
     /// then waits for its reader's requests on a thread of its own,
-    /// so one connected reader never blocks another's join.
-    ///
-    /// TODO: a reader that joins a group but never connects its RDMA
-    /// side stalls the rendezvous of the readers behind it — there is
-    /// no timeout on the RDMA accept yet; bound it by polling the
-    /// event channel if that matters.
+    /// so one connected reader never blocks another's join. The
+    /// accept loop waits on the listener itself, so a connection is
+    /// taken the moment it arrives — a recovering reader's fresh
+    /// session is never delayed by the shutdown-check interval. A
+    /// rendezvous whose reader never connects its RDMA side (or
+    /// whose connection churn arrives instead — see
+    /// [`rdma::Listener::accept_group_into`]) fails within the
+    /// accept's bound rather than stalling the rendezvous of the
+    /// readers behind it: its reader retries the exchange, and the
+    /// service moves on.
     pub fn serve(&self) -> io::Result<()> {
         if self.service.borrow().is_some() {
             return Err(io::Error::new(
@@ -622,32 +628,49 @@ impl Shared {
     /// trivially done — and its grant is left to the lazy binding
     /// its next tuple request builds. Everything else happens under
     /// the groups lock: the binding, and the connection its bind
-    /// posts through, are all there (see [`GroupEntry`]).
+    /// posts through, are all there (see [`GroupEntry`]). The
+    /// binding is taken out of the map for the operation — the bind
+    /// posts through the group's connections while holding the
+    /// window and its backing, two borrows of one entry — and put
+    /// back whatever the outcome: a failed bind leaves the binding
+    /// (and its command) standing, for the retry.
     fn window_operation(&self, id: u32, group: u32, op: WindowOperation) -> io::Result<()> {
         let mut groups = self.groups.lock().unwrap();
         let Some(entry) = groups.get_mut(&group) else {
             return Ok(());
         };
-        let Some(binding) = entry.bindings.get(&id) else {
+        let Some(binding) = entry.bindings.remove(&id) else {
             return Ok(());
         };
-        let Some((window, backing)) = binding.window() else {
-            return Err(io::Error::other(format!(
-                "region {id} is served to group {group} as a plain registration; \
-                 only windowed regions can be revoked or granted"
-            )));
+        let result = match op {
+            WindowOperation::Revoke => binding.bind(entry, false),
+            WindowOperation::Grant => binding.bind(entry, true),
         };
-        match op {
-            WindowOperation::Revoke => {
-                entry.bind_through(|conn| conn.unbind_mw(window, backing))?;
-            }
-            WindowOperation::Grant => {
-                entry.bind_through(|conn| {
+        entry.bindings.insert(id, binding);
+        result
+    }
+}
+
+impl GroupBinding {
+    /// One window operation — the revoke (a bind to zero length) or
+    /// the grant (a bind over the full range) — posted through the
+    /// group's connections.
+    fn bind(&self, entry: &mut GroupEntry, grant: bool) -> io::Result<()> {
+        let Some((window, backing)) = self.window() else {
+            return Err(io::Error::other(
+                "the region is served as a plain registration; \
+                 only windowed regions can be revoked or granted",
+            ));
+        };
+        if grant {
+            entry
+                .bind_through(|conn| {
                     conn.bind_mw(window, backing, backing.addr(), backing.size() as u64)
-                })?;
-            }
+                })
+                .map(|_| ())
+        } else {
+            entry.bind_through(|conn| conn.unbind_mw(window, backing))
         }
-        Ok(())
     }
 }
 
@@ -660,19 +683,32 @@ impl GroupEntry {
     /// the queue pairs to post through; the newest is the live
     /// session's, and an older one that has failed flushes the bind
     /// (reported, the binding stands) — which is what walking to
-    /// the next connection retries. A group with no connection at
+    /// the next connection retries. A connection whose post
+    /// flushed is dead, and is pruned right there: a group whose
+    /// reader is recovering holds its failed connection until the
+    /// fresh rendezvous replaces it, and without the pruning every
+    /// later window operation — the agent's per-tick retries above
+    /// all — would pay the failed post first, every time. A group
+    /// with no connection at
     /// all cannot post: the error says so. The bind's completion is
     /// awaited inside, a few microseconds, under the caller's lock —
     /// every other user of the lock holds it for memory operations
     /// only, so the contention is bounded, and the hold is what
     /// serializes window operations with group changes, exactly the
     /// ordering revocation wants.
-    fn bind_through<T>(&self, op: impl Fn(&rdma::Connection) -> io::Result<T>) -> io::Result<T> {
+    fn bind_through<T>(&mut self, op: impl Fn(&rdma::Connection) -> io::Result<T>) -> io::Result<T> {
         let mut failure = None;
-        for connection in self.connections.iter().rev() {
-            match op(connection) {
+        let mut index = self.connections.len();
+        while index > 0 {
+            index -= 1;
+            match op(&self.connections[index]) {
                 Ok(value) => return Ok(value),
-                Err(e) => failure = Some(e),
+                Err(e) => {
+                    if is_flushed(&e) {
+                        self.connections.remove(index);
+                    }
+                    failure = Some(e);
+                }
             }
         }
         Err(failure.unwrap_or_else(|| {
@@ -729,8 +765,11 @@ impl Shared {
     }
 }
 
-/// How often the service thread re-checks shutdown between accept
-/// attempts.
+/// How often the service thread re-checks shutdown while waiting
+/// for the next connection. The wait is on the listener itself —
+/// readable the moment a connection arrives — so a rendezvous pays
+/// microseconds, never up to this interval; only the shutdown
+/// check does.
 const SERVICE_POLL: Duration = Duration::from_millis(100);
 
 /// The running service, joined when the provider drops.
@@ -773,14 +812,25 @@ impl Service {
     /// Accept readers until shutdown, one rendezvous at a time.
     fn run(mut self) {
         // Polling accept: closing a listener does not reliably wake a
-        // blocked accept on Linux, but the flag is checked between
-        // attempts.
+        // blocked accept on Linux, so the listener is non-blocking and
+        // each failed attempt waits on the listener's own descriptor
+        // — readable the instant a connection arrives, bounded by
+        // SERVICE_POLL for the shutdown flag. A fixed sleep here would
+        // price every fresh rendezvous — a recovering reader's
+        // session re-establishment above all — up to the sleep's
+        // whole interval.
         let _ = self.tcp.set_nonblocking(true);
         while !self.shutdown.load(Ordering::Relaxed) {
             match self.tcp.accept() {
                 Ok((stream, _)) => {
                     let _ = stream.set_nonblocking(false);
                     let _ = self.handshake(stream);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if let Err(e) = rdma::poll_readable(self.tcp.as_raw_fd(), SERVICE_POLL) {
+                        eprintln!("the session service's accept wait failed: {e}; retrying");
+                        thread::sleep(SERVICE_POLL);
+                    }
                 }
                 Err(_) => thread::sleep(SERVICE_POLL),
             }
@@ -824,7 +874,11 @@ impl Service {
 
         // The rendezvous: the reader's RDMA connection follows its
         // group join; accept it into the group's domain, creating the
-        // group (and the domain) on first use. The domain handle is
+        // group (and the domain) on first use. The accept matches the
+        // group the connection announces in its private data against
+        // this session's — a stale or out-of-order request of a
+        // concurrent recovery is rejected, never wired into the wrong
+        // group's domain. The domain handle is
         // cloned before the blocking accept, so no lock is held while
         // it waits.
         let group_pd = self
@@ -835,8 +889,8 @@ impl Service {
             .get(&group)
             .map(|entry| entry.pd.clone());
         let connection = match group_pd {
-            Some(pd) => self.rdma.accept_into(&pd)?,
-            None => self.rdma.accept()?,
+            Some(pd) => self.rdma.accept_group_into(&pd, group)?,
+            None => self.rdma.accept_group(group)?,
         };
         self.shared
             .groups
@@ -915,5 +969,57 @@ impl SessionThread {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpStream;
+    use std::time::Instant;
+
+    /// The session service's accept loop must wait *on the
+    /// listener*, waking the instant a connection arrives — never
+    /// on a fixed sleep. A recovering reader's fresh session
+    /// blocks reading its `Welcome` behind that wait, and the
+    /// experiment's writer does not wait for the reader: a fixed
+    /// sleep here prices every mid-run rendezvous up to the
+    /// interval (observed in the field as readers frozen mid-run
+    /// and barriers stalled on binds with no live queue pair).
+    #[test]
+    fn the_accept_wait_wakes_on_a_pending_connection() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _ = listener.set_nonblocking(true);
+
+        // The connection lands while the loop is already inside its
+        // wait, as it would mid-run.
+        let connector = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            let _ = TcpStream::connect(addr);
+        });
+
+        // The service loop's shape: a failed accept waits on the
+        // listener itself, bounded by the shutdown-check interval.
+        let started = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok(_) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(rdma::poll_readable(listener.as_raw_fd(), SERVICE_POLL).unwrap());
+                }
+                Err(e) => panic!("the accept failed unexpectedly: {e}"),
+            }
+        }
+        connector.join().unwrap();
+
+        // The wake must beat the shutdown interval by a wide margin:
+        // a fixed `sleep(SERVICE_POLL)` instead of the wait reports
+        // ~100 ms here.
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(80),
+            "the accept noticed the connection after {waited:?} — a wait, not a wake"
+        );
     }
 }

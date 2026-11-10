@@ -270,16 +270,30 @@ pub(crate) fn write_frame(stream: &mut impl Write, msg: &Message) -> io::Result<
 /// The reader keeps it open after the initial exchange, so it can
 /// re-request the catalog ([`Message::Update`]) — and, in the future,
 /// receive provider-side notifications.
+///
+/// The stream is created `TCP_NODELAY`: the protocol's exchanges are
+/// bursts of small back-to-back frames — a catalog, then its tuples —
+/// with the peer blocked in `receive` in between, which is Nagle's
+/// worst case. Nagle holds the second frame until the first is
+/// ACKed, and the blocked peer has nothing to piggyback that ACK
+/// on, so its stack sits on it for the delayed-ACK timer (~40 ms on
+/// Linux): one timer per exchange, invisible as a slow *startup*
+/// but paid twice by a mid-run recovery (the fresh session, then
+/// the tuples re-request that carries the fresh rkey). Observed in
+/// the field as ~45 ms per session and ~90 ms per recovery, both
+/// `update` phases slow and the RDMA-only phases sub-millisecond.
 #[derive(Debug)]
 pub(crate) struct Channel {
     stream: TcpStream,
 }
 
 impl Channel {
-    /// Adopt an established TCP stream, arming the I/O timeouts.
+    /// Adopt an established TCP stream, arming the I/O timeouts
+    /// and disabling Nagle (see the type's documentation for why).
     pub(crate) fn new(stream: TcpStream) -> io::Result<Self> {
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
+        stream.set_nodelay(true)?;
         Ok(Self { stream })
     }
 

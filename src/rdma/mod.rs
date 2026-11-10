@@ -28,10 +28,12 @@
 //!   completion, per the verbs contract.
 //!
 //! Failed completions are classified: a remote access violation
-//! ([`is_remote_access`] — the failure a revoked access reads as)
-//! and a flush ([`is_flushed`] — the failed queue pair's goodbye)
-//! can be told apart from everything else, which is what a
-//! consumer acting on permissions needs.
+//! ([`is_remote_access`] — the failure a revoked access reads as),
+//! the remote operation error ([`is_remote_op`] — the same
+//! revocation aborting an operation it had already admitted), and
+//! a flush ([`is_flushed`] — the failed queue pair's goodbye) can
+//! be told apart from everything else, which is what a consumer
+//! acting on permissions needs.
 //!
 //! Registrations keep their protection domain alive (they hold a
 //! handle of it), so a [`MemoryRegion`] may outlive the connection it
@@ -75,5 +77,6 @@ mod verbs;
 
 pub use verbs::{
     CompletionError, CompletionStatus, Connection, Listener, MemoryRegion, MemoryWindow,
-    ProtectionDomain, is_flushed, is_remote_access,
+    ProtectionDomain, is_flushed, is_remote_access, is_remote_op,
 };
+pub(crate) use verbs::poll_readable;

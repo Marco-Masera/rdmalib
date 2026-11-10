@@ -28,6 +28,17 @@ const RESOLVE_TIMEOUT_MS: c_int = 2000;
 /// How long [`Connection::read`] waits for the read completion.
 const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long an accept — or a connect's establishment — waits for
+/// its next connection-manager event before giving up. The session
+/// service accepts one rendezvous at a time, so an accept whose
+/// peer vanished mid-rendezvous must *fail* (its reader retries
+/// the exchange), never wedge every later rendezvous behind it.
+const CM_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the bounded event waits ([`CM_EVENT_TIMEOUT`])
+/// re-check the channel.
+const CM_EVENT_POLL: Duration = Duration::from_millis(1);
+
 /// Depth of the per-connection completion queue; the queue pair is
 /// created with as many send work requests.
 const CQ_SIZE: c_int = 16;
@@ -102,10 +113,14 @@ const IBV_ACCESS_MW_BIND: c_int = 1 << 4;
 // Completion statuses (from `enum ibv_wc_status`), besides success:
 // the flush ends a failed queue pair's stream, the remote access
 // violation is the memory-protection "no" — the failure a revoked
-// (or otherwise invalid) access reads as.
+// (or otherwise invalid) access reads as — and the remote
+// operation error is the rarer flavor of the same "no": an
+// operation protection had already admitted, aborted mid-flight
+// when the grant under it was revoked out from under it.
 const IBV_WC_SUCCESS: c_int = 0;
 const IBV_WC_WR_FLUSH_ERR: c_int = 5;
 const IBV_WC_REM_ACCESS_ERR: c_int = 10;
+const IBV_WC_REM_OP_ERR: c_int = 11;
 // The type of memory window to allocate: type 1 — the kind scoped
 // to the protection domain rather than a queue pair number, so
 // every queue pair of the domain can use the window's rkey and a
@@ -209,7 +224,7 @@ struct IbvSrq {
 /// (`struct rdma_event_channel`).
 #[repr(C)]
 struct RdmaEventChannel {
-    _private: [u8; 0],
+    fd: c_int,
 }
 
 /// A registered memory region (`struct ibv_mr`).
@@ -362,8 +377,10 @@ struct RdmaCmId {
     qp: *mut IbvQp,
 }
 
-/// A connection manager event (`struct rdma_cm_event`); the trailing
-/// `param` union is never accessed.
+/// A connection manager event (`struct rdma_cm_event`); the `param`
+/// union is read only for a connection request, where its `conn`
+/// arm carries the requester's private data (the join's group id
+/// — see [`Listener::accept_group_into`]).
 #[repr(C)]
 #[allow(dead_code)]
 struct RdmaCmEvent {
@@ -371,6 +388,7 @@ struct RdmaCmEvent {
     listen_id: *mut RdmaCmId,
     event: c_int,
     status: c_int,
+    param: RdmaConnParam,
 }
 
 /// Connection parameters (`struct rdma_conn_param`).
@@ -453,8 +471,33 @@ unsafe extern "C" {
     fn rdma_destroy_qp(id: *mut RdmaCmId);
     fn rdma_connect(id: *mut RdmaCmId, conn_param: *mut RdmaConnParam) -> c_int;
     fn rdma_accept(id: *mut RdmaCmId, conn_param: *mut RdmaConnParam) -> c_int;
+    fn rdma_reject(
+        id: *mut RdmaCmId,
+        private_data: *const c_void,
+        private_data_len: u8,
+    ) -> c_int;
     fn rdma_disconnect(id: *mut RdmaCmId) -> c_int;
     fn rdma_event_str(event: c_int) -> *const c_char;
+}
+
+/// A `poll`ed file descriptor (`struct pollfd`), for waiting on a
+/// connection-manager event channel with a deadline — the
+/// connection-manager's own `rdma_get_cm_event` blocks
+/// indefinitely, and the session service must not wedge on a
+/// rendezvous whose peer vanished.
+#[repr(C)]
+struct PollFd {
+    fd: c_int,
+    events: i16,
+    revents: i16,
+}
+
+/// `poll`'s "readable" interest (`POLLIN`).
+const POLLIN: i16 = 0x001;
+
+#[link(name = "c")]
+unsafe extern "C" {
+    fn poll(fds: *mut PollFd, nfds: u64, timeout_ms: c_int) -> c_int;
 }
 
 /// Turn a non-zero C return value into an `io::Error`.
@@ -510,6 +553,14 @@ pub enum CompletionStatus {
     /// this is the no-permission signal; the failed queue pair then
     /// completes its remaining work as [`Self::Flushed`].
     RemoteAccess,
+    /// The remote aborted an operation it had already admitted: for
+    /// a windowed access, the flavor a revocation takes when the
+    /// revoke's bind commits while the operation is in flight — the
+    /// rkey was honored, and the window moved underneath it. The
+    /// same no-permission signal as [`Self::RemoteAccess`], arriving
+    /// mid-flight instead of at the door; the failed queue pair then
+    /// completes its remaining work as [`Self::Flushed`].
+    RemoteOp,
     /// The operation flushed: its queue pair has failed and been
     /// abandoned, so nothing more can be posted through it.
     Flushed,
@@ -521,6 +572,7 @@ impl CompletionStatus {
     fn of(status: c_int) -> Self {
         match status {
             IBV_WC_REM_ACCESS_ERR => CompletionStatus::RemoteAccess,
+            IBV_WC_REM_OP_ERR => CompletionStatus::RemoteOp,
             IBV_WC_WR_FLUSH_ERR => CompletionStatus::Flushed,
             _ => CompletionStatus::Other,
         }
@@ -576,6 +628,17 @@ pub fn is_remote_access(err: &io::Error) -> bool {
     completion_status(err) == Some(CompletionStatus::RemoteAccess)
 }
 
+/// Whether `err` is the remote aborting an operation it had already
+/// admitted — the rarer flavor of a revocation: the bind that
+/// revokes a grant may commit while an admitted operation under it
+/// is still running, and the device aborts that operation as a
+/// remote operation error instead of refusing the next one up front
+/// ([`is_remote_access`]). A consumer treating revocation as
+/// no-permission must classify both flavors.
+pub fn is_remote_op(err: &io::Error) -> bool {
+    completion_status(err) == Some(CompletionStatus::RemoteOp)
+}
+
 /// Whether `err` is a flush: the operation's queue pair has failed
 /// and its outstanding work was abandoned — a replacement
 /// connection is required for anything further.
@@ -603,10 +666,24 @@ fn resolve_v4<A: ToSocketAddrs>(addr: A) -> io::Result<SocketAddrV4> {
 
 /// Connection parameters, mirroring the choices of the C library:
 /// a few outstanding one-sided operations, generous connect retries.
-fn conn_param() -> RdmaConnParam {
+/// `private` travels with the request to the listener — the
+/// joining group's id, which [`Listener::accept_group_into`]
+/// matches its rendezvous against.
+fn conn_param(private: Option<&[u8]>) -> RdmaConnParam {
+    let (private_data, private_data_len) = match private {
+        Some(bytes) => {
+            assert!(
+                !bytes.is_empty() && bytes.len() <= u8::MAX as usize,
+                "the connect's private data is at most 255 bytes (got {})",
+                bytes.len()
+            );
+            (bytes.as_ptr() as *const c_void, bytes.len() as u8)
+        }
+        None => (std::ptr::null(), 0),
+    };
     RdmaConnParam {
-        private_data: std::ptr::null(),
-        private_data_len: 0,
+        private_data,
+        private_data_len,
         responder_resources: 3,
         initiator_depth: 3,
         flow_control: 0,
@@ -631,6 +708,96 @@ fn wait_event(channel: *mut RdmaEventChannel, expected: c_int, step: &str) -> io
         )));
     }
     check("rdma_ack_cm_event", ack)
+}
+
+/// One acknowledged connection-manager event. The private data a
+/// connection request carried is copied out before the
+/// acknowledgement (the event's memory is only valid until then).
+#[derive(Debug)]
+struct CmEvent {
+    /// The event's connection id: the pending connection of a
+    /// request, the connection of an established or disconnected
+    /// one.
+    id: *mut RdmaCmId,
+    event: c_int,
+    status: c_int,
+    /// The group id a connection request announced in its private
+    /// data, `None` when it carried none.
+    private_group: Option<u32>,
+}
+
+/// The next event on `channel`, acknowledged — or `None` when none
+/// arrived within `within`. Unlike [`wait_event`], which blocks
+/// indefinitely, this bounds the wait, so a rendezvous whose peer
+/// vanished fails instead of wedging the (serial) session service
+/// behind it.
+fn next_event(
+    channel: *mut RdmaEventChannel,
+    within: Duration,
+) -> io::Result<Option<CmEvent>> {
+    let mut polled = PollFd {
+        fd: unsafe { (*channel).fd },
+        events: POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe {
+        poll(
+            &mut polled,
+            1,
+            within.as_millis().min(i32::MAX as u128) as c_int,
+        )
+    };
+    if ready < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if ready == 0 {
+        return Ok(None);
+    }
+    let mut event: *mut RdmaCmEvent = std::ptr::null_mut();
+    if check("rdma_get_cm_event", unsafe { rdma_get_cm_event(channel, &mut event) }).is_err() {
+        // A spurious wakeup of `poll` (a hang-up, say): no event yet.
+        return Ok(None);
+    }
+    let (id, event_type, status, param) =
+        unsafe { ((*event).id, (*event).event, (*event).status, &(*event).param) };
+    let private_group = if param.private_data_len >= 4 && !param.private_data.is_null() {
+        Some(unsafe { *(param.private_data as *const u32) })
+    } else {
+        None
+    };
+    let ack = unsafe { rdma_ack_cm_event(event) };
+    check("rdma_ack_cm_event", ack)?;
+    Ok(Some(CmEvent {
+        id,
+        event: event_type,
+        status,
+        private_group,
+    }))
+}
+
+/// Wait until `fd` is readable, or `within` elapses: `Ok(true)` when
+/// it became readable, `Ok(false)` on the timeout. The session
+/// service's accept loop uses this to wait for the next TCP
+/// connection between shutdown checks — a fixed sleep there would
+/// price every fresh rendezvous (a recovering reader's session
+/// re-establishment above all) up to the sleep's whole interval.
+pub(crate) fn poll_readable(fd: c_int, within: Duration) -> io::Result<bool> {
+    let mut polled = PollFd {
+        fd,
+        events: POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe {
+        poll(
+            &mut polled,
+            1,
+            within.as_millis().min(i32::MAX as u128) as c_int,
+        )
+    };
+    if ready < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ready > 0)
 }
 
 /// A locally registered memory region.
@@ -996,6 +1163,20 @@ impl Connection {
     /// Resolves the address and route, creates the connection
     /// resources, and establishes the connection.
     pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        Self::connect_impl(addr, None)
+    }
+
+    /// As [`Self::connect`], announcing `group` in the connect's
+    /// private data: the listener matches its rendezvous against
+    /// it ([`Listener::accept_group_into`]), so a stale or
+    /// out-of-order connection request is rejected rather than
+    /// accepted into the wrong group's protection domain.
+    pub fn connect_group<A: ToSocketAddrs>(addr: A, group: u32) -> io::Result<Self> {
+        let private = group.to_ne_bytes();
+        Self::connect_impl(addr, Some(&private))
+    }
+
+    fn connect_impl<A: ToSocketAddrs>(addr: A, private: Option<&[u8]>) -> io::Result<Self> {
         let mut dst = SockaddrIn::from(resolve_v4(addr)?);
         let event_channel =
             check_ptr("rdma_create_event_channel", unsafe { rdma_create_event_channel() })?;
@@ -1007,13 +1188,13 @@ impl Connection {
             inline_cap: 0,
             next_wr_id: Cell::new(0),
         };
-        conn.connect_to(&mut dst)?;
+        conn.connect_to(&mut dst, private)?;
         Ok(conn)
     }
 
     /// Establish the connection; on failure the partially built `conn`
     /// is dropped by the caller, releasing the resources created so far.
-    fn connect_to(&mut self, dst: &mut SockaddrIn) -> io::Result<()> {
+    fn connect_to(&mut self, dst: &mut SockaddrIn, private: Option<&[u8]>) -> io::Result<()> {
         check(
             "rdma_create_id",
             unsafe {
@@ -1046,9 +1227,36 @@ impl Connection {
         let context = unsafe { (*self.id).verbs };
         let pd = ProtectionDomain::alloc(context)?;
         self.create_resources(pd)?;
-        let mut param = conn_param();
+        let mut param = conn_param(private);
         check("rdma_connect", unsafe { rdma_connect(self.id, &mut param) })?;
-        wait_event(self.event_channel, RDMA_CM_EVENT_ESTABLISHED, "rdma_connect")
+        // The establishment, bounded: a listener that never accepts
+        // (wedged behind a peer that vanished, or absent) must fail
+        // this connect — its caller retries — not block it forever.
+        let deadline = Instant::now() + CM_EVENT_TIMEOUT;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(format!(
+                    "rdma_connect: no establishment within {CM_EVENT_TIMEOUT:?}"
+                )));
+            }
+            let Some(event) = next_event(self.event_channel, CM_EVENT_POLL)? else {
+                continue;
+            };
+            if event.id != self.id {
+                // Not this connection's event — nothing else shares
+                // this channel, but acknowledge whatever arrived.
+                continue;
+            }
+            if event.event == RDMA_CM_EVENT_ESTABLISHED && event.status == 0 {
+                return Ok(());
+            }
+            return Err(io::Error::other(format!(
+                "rdma_connect: expected {}, got {} (status {})",
+                event_name(RDMA_CM_EVENT_ESTABLISHED),
+                event_name(event.event),
+                event.status
+            )));
+        }
     }
 
     /// Create the completion queue and the queue pair on this
@@ -1531,7 +1739,7 @@ impl Listener {
     /// accepts. The established event of an accepted connection is
     /// reported on this listener's event channel.
     pub fn accept(&self) -> io::Result<Connection> {
-        self.accept_impl(None)
+        self.accept_impl(None, None)
     }
 
     /// Block until a connection request arrives, and accept it into
@@ -1543,24 +1751,82 @@ impl Listener {
     /// the connection, if it arrives on a different device than the
     /// one `pd` belongs to.
     pub fn accept_into(&self, pd: &ProtectionDomain) -> io::Result<Connection> {
-        self.accept_impl(Some(pd))
+        self.accept_impl(Some(pd), None)
     }
 
-    fn accept_impl(&self, pd: Option<&ProtectionDomain>) -> io::Result<Connection> {
-        let mut event: *mut RdmaCmEvent = std::ptr::null_mut();
-        check(
-            "rdma_get_cm_event",
-            unsafe { rdma_get_cm_event(self.event_channel, &mut event) },
-        )?;
-        let (child, event_type, status) = unsafe { ((*event).id, (*event).event, (*event).status) };
-        let ack = unsafe { rdma_ack_cm_event(event) };
-        if event_type != RDMA_CM_EVENT_CONNECT_REQUEST || status != 0 {
-            return Err(io::Error::other(format!(
-                "expected a connection request, got {} (status {status})",
-                event_name(event_type)
-            )));
-        }
-        check("rdma_ack_cm_event", ack)?;
+    /// As [`Self::accept`], matching the request against the group
+    /// it announces in its private data (see
+    /// [`Connection::connect_group`]): a request of another group —
+    /// a stale or out-of-order one — is rejected, and the accept
+    /// keeps waiting for its own.
+    pub fn accept_group(&self, expected_group: u32) -> io::Result<Connection> {
+        self.accept_impl(None, Some(expected_group))
+    }
+
+    /// As [`Self::accept_into`], matching the request against the
+    /// group it announces in its private data (see
+    /// [`Connection::connect_group`]): a request of another group —
+    /// a stale or out-of-order one — is rejected, and the accept
+    /// keeps waiting for its own.
+    pub fn accept_group_into(
+        &self,
+        pd: &ProtectionDomain,
+        expected_group: u32,
+    ) -> io::Result<Connection> {
+        self.accept_impl(Some(pd), Some(expected_group))
+    }
+
+    /// The accept, one qualifier pair at a time.
+    ///
+    /// Two properties the naive accept lacks, both of which the
+    /// session service depends on: every event on this listener's
+    /// channel that is not *this* rendezvous's connection request
+    /// is **acknowledged and drained, never failed on** — accepted
+    /// connections share the channel, and the disconnects of the
+    /// connections recovery replaces are ordinary churn, not
+    /// errors — and both waits (the request, then the
+    /// establishment) are **bounded** by [`CM_EVENT_TIMEOUT`], so
+    /// a rendezvous whose peer vanished fails (its reader retries)
+    /// instead of wedging the serial service behind it.
+    fn accept_impl(
+        &self,
+        pd: Option<&ProtectionDomain>,
+        expected_group: Option<u32>,
+    ) -> io::Result<Connection> {
+        let deadline = Instant::now() + CM_EVENT_TIMEOUT;
+
+        // The connection request. Events of previously accepted
+        // connections arrive on this channel too — disconnects of
+        // replaced connections above all — and a request may be
+        // stale (its reader's exchange failed after it connected)
+        // or out of order; the group it announces tells them apart.
+        let child = loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(format!(
+                    "rdma_accept: no connection request within {CM_EVENT_TIMEOUT:?}"
+                )));
+            }
+            let Some(event) = next_event(self.event_channel, CM_EVENT_POLL)? else {
+                continue;
+            };
+            if event.event != RDMA_CM_EVENT_CONNECT_REQUEST || event.status != 0 {
+                // Churn of other connections sharing this channel —
+                // acknowledge it and keep waiting.
+                continue;
+            }
+            if let Some(expected) = expected_group
+                && event.private_group != Some(expected)
+            {
+                // A request of another group: reject it — its
+                // reader fails this attempt and retries — release
+                // the rejected connection, and keep waiting for
+                // this rendezvous's own.
+                let _ = unsafe { rdma_reject(event.id, std::ptr::null(), 0) };
+                let _ = unsafe { rdma_destroy_id(event.id) };
+                continue;
+            }
+            break event.id;
+        };
 
         let mut conn = Connection {
             id: child,
@@ -1585,10 +1851,34 @@ impl Listener {
             None => ProtectionDomain::alloc(context)?,
         };
         conn.create_resources(pd)?;
-        let mut param = conn_param();
+        let mut param = conn_param(None);
         check("rdma_accept", unsafe { rdma_accept(conn.id, &mut param) })?;
-        wait_event(self.event_channel, RDMA_CM_EVENT_ESTABLISHED, "rdma_accept")?;
-        Ok(conn)
+
+        // The establishment, bounded, draining the churn: only this
+        // connection's events decide the outcome; everything else
+        // on the shared channel is acknowledged and ignored.
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(format!(
+                    "rdma_accept: no establishment within {CM_EVENT_TIMEOUT:?}"
+                )));
+            }
+            let Some(event) = next_event(self.event_channel, CM_EVENT_POLL)? else {
+                continue;
+            };
+            if event.id != conn.id {
+                continue;
+            }
+            if event.event == RDMA_CM_EVENT_ESTABLISHED && event.status == 0 {
+                return Ok(conn);
+            }
+            return Err(io::Error::other(format!(
+                "rdma_accept: expected {}, got {} (status {})",
+                event_name(RDMA_CM_EVENT_ESTABLISHED),
+                event_name(event.event),
+                event.status
+            )));
+        }
     }
 }
 
@@ -1687,10 +1977,20 @@ mod tests {
     #[test]
     fn cm_struct_layouts() {
         assert_eq!(size_of::<RdmaConnParam>(), 24);
-        assert_eq!(size_of::<RdmaCmEvent>(), 24);
+        // The event's `param` union starts after the status word;
+        // its `conn` arm — all that is ever read from it, a
+        // connection request's private data — sits at that offset.
+        assert_eq!(size_of::<RdmaCmEvent>(), 48);
         assert_eq!(offset_of!(RdmaCmEvent, id), 0);
         assert_eq!(offset_of!(RdmaCmEvent, event), 16);
         assert_eq!(offset_of!(RdmaCmEvent, status), 20);
+        assert_eq!(offset_of!(RdmaCmEvent, param), 24);
+        assert_eq!(size_of::<RdmaEventChannel>(), 4);
+        assert_eq!(offset_of!(RdmaEventChannel, fd), 0);
+        assert_eq!(size_of::<PollFd>(), 8);
+        assert_eq!(offset_of!(PollFd, fd), 0);
+        assert_eq!(offset_of!(PollFd, events), 4);
+        assert_eq!(offset_of!(PollFd, revents), 6);
         assert_eq!(size_of::<RdmaCmId>(), 32);
         assert_eq!(offset_of!(RdmaCmId, verbs), 0);
         assert_eq!(offset_of!(RdmaCmId, channel), 8);
