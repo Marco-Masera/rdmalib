@@ -1,44 +1,95 @@
 # RDMA-Lib
 
-Name is temporary. Lib is in development.
-Provides abstraction to RDMA primitives for Rust applications.
+Name is temporary. The library is in development.
+It provides abstraction to RDMA primitives for Rust applications, specifically for disaggregated memory settings.
 
+# Structure
 
-# Usage 
+Targeting DM settings, the library is asimmetrical, separating who offers its local memory remotely, and who accesses it:
+* `SharedMemoryRegionProvider` -> A construct that allows processes to share parts of their local memory.
+* `RemoteMemoryRegion` -> A construc that allows to access remote regions.
 
-Both sides exchange metadata over TCP; the data itself travels over
-RDMA, with no copies on either side. Both nodes define the same
-shared type (they are separately compiled — the library checks the
-element layout, the type identity is the developer's responsibility):
+That said, nothing forbids a single Node to play both roles.
 
+# Usage
+
+## Define custom data types (optional)
+
+Applications can define and register their own data types. 
+Only types with compile time known size are accepted, and the macro `impl_remote_safe!` validates the constraint.
 ```rust
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Test {
-    v: usize,
+struct MyDataType {
+    v: u32,
+    fixed_size_string: [u8; 64]
 }
 rdmalib::impl_remote_safe!(Test);
 ```
 
-Node 1 creates the array and shares it:
+## Share a local buffer
 
 ```rust
-let owner = rdmalib::SharedMemoryRegionProvider::new(
-    rdmalib::SharedMemoryRegionProviderAddr::new(18515, 9917)); // RDMA, TCP ports
-let handle = owner.register_typed("tests", vec![Test { v: 1 }, Test { v: 2 }, Test { v: 3 }]);
-owner.serve()?; // binds both ports, serves readers in the background
+// Initialize the SharedMemoryRegionProvider struct
+let address = SharedMemoryRegionProviderAddr::new(
+1010, //RDMA port
+2020, // TCP tcp_port
+);
+let shared_memory_provider = SharedMemoryRegionProvider::new(address);
+shared_memory_provider.serve()?;
+
+// Define a memory region to share 
+let mut buffer = vec![MyDataType; 256];
+// Share it 
+let handle: SharedMemoryRegionHandle<MyDataType> shared_memory_provider.register_typed(
+    "MyBuffer", //Name for the memory region
+    buffer // Now buffer is owned by the SharedMemoryRegionProvider
+);
 ```
 
-Node 2 runs a session and reads the array and its values:
+## Access a remote address, read and write
+
+In order to access a remote region, the process must first connect to the Provider, then obtain a `RemoteMemoryRegion` instance.
 
 ```rust
-let reader = rdmalib::RemoteMemoryProvider::new(
-    rdmalib::RemoteMemoryProviderAddr::new("node1", 18515, 9917));
-reader.update(0)?; // session: greet, join group 0, RDMA rendezvous, tuples
-let catalog = reader.get_remote_mr_metadata();
-let region = reader.get_remote_mr(catalog.find_by_name("tests")?, Some(0)).unwrap();
-let tests = region.read_typed::<Test>(0, 3)?; // [Test { v: 1 }, Test { v: 2 }, Test { v: 3 }]
-assert_eq!(tests.iter().map(|t| t.v).collect::<Vec<_>>(), vec![1, 2, 3]);
+// Attach to the remote memory provider
+let memory_node_addr = RemoteMemoryProviderAddr::new(
+    "192.168.1.1", // IP address of the owner of the memory
+    1010, // RDMA port of the owner 
+    2020, // TCP port of the owner
+)
+let remote_memory = RemoteMemoryProvider::new();
+remote_memory.update(0)?; // Join a group, refresh the metadata
+let catalog = remote_memory.get_remote_mr_metadata(); // get the metadata 
+
+// Connect to a region - using the region name
+let region_metadata = catalog.find_by_name("MyBuffer".as_ref())?;
+let region: RemoteMemoryRegion = remote_memory.get_remote_mr(region_metadata, Some(0))
+```
+
+With `RemoteMemoryRegion`, the process can read remote memory:
+
+```rust
+// Read from remote memory, allocating local memory to store the data
+let mut content: Vec<MyDataType> = region.read_typed::<MyDataType>(
+    0, 10 // offset - num_elements. This call reads the first 10 elements in the buffer
+)?;
+
+// The reader can also provide a reference to a local buffer, skipping memory allocation
+region.read_into_typed(
+    30, &mut content // content is filled from element 30 onward, until full
+);
+```
+
+And write on remote memory:
+```rust
+// Define what you want to write 
+let to_write: &[MyDataType] = & [
+    MyDataType { v: 1, fixed_size_string: [0; 64] },
+    MyDataType { v: 2, fixed_size_string: [b'a'; 64] },
+];
+// Write it at position 10
+region.write_typed(10, to_write);
 ```
 
 ## Revocable access
