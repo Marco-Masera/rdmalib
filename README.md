@@ -36,7 +36,7 @@ let reader = rdmalib::RemoteMemoryProvider::new(
     rdmalib::RemoteMemoryProviderAddr::new("node1", 18515, 9917));
 reader.update(0)?; // session: greet, join group 0, RDMA rendezvous, tuples
 let catalog = reader.get_remote_mr_metadata();
-let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
+let region = reader.get_remote_mr(catalog.find_by_name("tests")?, Some(0)).unwrap();
 let tests = region.read_typed::<Test>(0, 3)?; // [Test { v: 1 }, Test { v: 2 }, Test { v: 3 }]
 assert_eq!(tests.iter().map(|t| t.v).collect::<Vec<_>>(), vec![1, 2, 3]);
 ```

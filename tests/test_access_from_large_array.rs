@@ -99,7 +99,7 @@ fn test_public_api() {
         // Catalog: set of regions shared by the writer - only one in this example
         let catalog = reader.get_remote_mr_metadata();
         // Get the region associated to the area. Some(0) is a self-assigned group for permissions
-        let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
+        let region = reader.get_remote_mr(&catalog.get_vec()[0], Some(0)).unwrap();
 
         // Read only 150 elements out of the 1000, from 100 to 149
         let smaller_buffer = region.read_typed::<Test>(100, 150).unwrap();

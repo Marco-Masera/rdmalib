@@ -35,7 +35,7 @@ fn region(elem_size: u32, elem_align: u32, elem_type: &str) -> RemoteMemoryRegio
 #[test]
 fn provider_starts_empty() {
     let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
-    assert!(provider.get_remote_mr_metadata().is_empty());
+    assert!(provider.get_remote_mr_metadata().get_vec().is_empty());
     assert!(provider.get_remote_mr(&metadata("missing", 0, 0), None).is_none());
     // Nothing connects until an update, and an update without a
     // reachable remote fails here.
@@ -84,7 +84,34 @@ fn lookup_by_metadata_and_group() {
     assert!(provider.get_remote_mr(&heap, Some(7)).is_none());
     // Same name, different id: a different region.
     assert!(provider.get_remote_mr(&metadata("heap", 8, 12288), None).is_none());
-    assert_eq!(provider.get_remote_mr_metadata(), vec![heap]);
+    assert_eq!(provider.get_remote_mr_metadata().get_vec(), &vec![heap]);
+}
+
+#[test]
+fn catalog_find_by_name_and_get_vec() {
+    let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
+
+    // An empty catalog finds nothing: the error names what was
+    // looked up.
+    assert_eq!(
+        provider.get_remote_mr_metadata().find_by_name("heap").unwrap_err(),
+        RegionNotFound {
+            name: "heap".into()
+        }
+    );
+
+    let heap = metadata("heap", 7, 12288);
+    provider.metadata.borrow_mut().push(heap.clone());
+
+    let catalog = provider.get_remote_mr_metadata();
+    assert_eq!(catalog.find_by_name("heap").unwrap(), &heap);
+    assert_eq!(
+        catalog.find_by_name("missing").unwrap_err(),
+        RegionNotFound {
+            name: "missing".into()
+        }
+    );
+    assert_eq!(catalog.get_vec(), &vec![heap]);
 }
 
 #[test]

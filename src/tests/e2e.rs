@@ -29,11 +29,12 @@ fn reader_reads_what_the_owner_shares() {
     ));
     reader.update(0).unwrap();
     let catalog = reader.get_remote_mr_metadata();
-    assert_eq!(catalog.len(), 1);
-    assert_eq!((catalog[0].name.as_str(), catalog[0].id), ("readings", handle.id()));
-    assert_eq!((catalog[0].elem_size, catalog[0].elem_align, catalog[0].elem_type.as_str()), (8, 8, "u64"));
+    let regions = catalog.get_vec();
+    assert_eq!(regions.len(), 1);
+    assert_eq!((regions[0].name.as_str(), regions[0].id), ("readings", handle.id()));
+    assert_eq!((regions[0].elem_size, regions[0].elem_align, regions[0].elem_type.as_str()), (8, 8, "u64"));
 
-    let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
+    let region = reader.get_remote_mr(&regions[0], Some(0)).unwrap();
     assert_eq!(region.read_typed::<u64>(0, 3).unwrap(), vec![42, 43, 44]);
     // The byte view of the same region: the first element's bytes.
     assert_eq!(region.read(0, 8).unwrap(), 42u64.to_ne_bytes());
@@ -49,8 +50,9 @@ fn reader_reads_what_the_owner_shares() {
     let late = owner.register_typed("counters", vec![7u32, 8]);
     reader.update(0).unwrap();
     let catalog = reader.get_remote_mr_metadata();
-    assert_eq!(catalog.len(), 2);
-    let late_meta = catalog
+    let regions = catalog.get_vec();
+    assert_eq!(regions.len(), 2);
+    let late_meta = regions
         .iter()
         .find(|metadata| metadata.id == late.id())
         .unwrap();
@@ -88,7 +90,7 @@ fn reader_writes_what_the_owner_shares() {
     ));
     reader.update(0).unwrap();
     let catalog = reader.get_remote_mr_metadata();
-    let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
+    let region = reader.get_remote_mr(&catalog.get_vec()[0], Some(0)).unwrap();
 
     region.write_typed::<u64>(1, &[7, 8]).unwrap();
     // The owner sees the written elements...
@@ -156,13 +158,7 @@ fn staged_and_registered_transfers() {
     ));
     reader.update(0).unwrap();
     let catalog = reader.get_remote_mr_metadata();
-    let by_name = |name: &str| {
-        catalog
-            .iter()
-            .find(|region| region.name == name)
-            .unwrap()
-            .clone()
-    };
+    let by_name = |name: &str| catalog.find_by_name(name).unwrap().clone();
     let bulk_region = reader.get_remote_mr(&by_name("bulk"), Some(0)).unwrap();
     let small_region = reader.get_remote_mr(&by_name("small"), Some(0)).unwrap();
 
@@ -286,7 +282,7 @@ fn registered_buffers_survive_a_reconnect() {
     ));
     reader.update(0).unwrap();
     let catalog = reader.get_remote_mr_metadata();
-    let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
+    let region = reader.get_remote_mr(&catalog.get_vec()[0], Some(0)).unwrap();
     let mut buffer = reader.register_buffer_typed(0, vec![0u64; 3]).unwrap();
     region.read_into_registered(0, 3, &mut buffer).unwrap();
     assert_eq!(buffer.as_slice(), &[7, 8, 9]);
@@ -305,7 +301,7 @@ fn registered_buffers_survive_a_reconnect() {
     // The buffer, registered in the old connection's domain,
     // re-registers on use — and works through the new one.
     let catalog = reader.get_remote_mr_metadata();
-    let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
+    let region = reader.get_remote_mr(&catalog.get_vec()[0], Some(0)).unwrap();
     region.read_into_registered(0, 3, &mut buffer).unwrap();
     assert_eq!(buffer.as_slice(), &[70, 80, 90]);
     region.write_from_registered(0, 3, &buffer).unwrap();

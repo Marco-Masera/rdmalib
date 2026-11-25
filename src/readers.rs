@@ -328,7 +328,8 @@ pub(crate) struct CachedRegion {
 
 /// Metadata describing a memory region exported by a remote machine.
 ///
-/// Returned by [`RemoteMemoryProvider::get_remote_mr_metadata`]; pass it
+/// Carried in the [`Catalog`] of
+/// [`RemoteMemoryProvider::get_remote_mr_metadata`]; pass it
 /// back to [`RemoteMemoryProvider::get_remote_mr`] to obtain the active
 /// region. The element layout is what the sharing side registered the
 /// region as: a typed read whose `T` does not match it fails instead
@@ -348,6 +349,53 @@ pub struct RemoteMemoryRegionMetadata {
     /// `std::any::type_name` of the element type, for diagnostics.
     pub elem_type: String,
 }
+
+/// The catalog of the memory regions a remote machine has shared, as
+/// of this provider's last [`RemoteMemoryProvider::update`].
+///
+/// A snapshot owned by the caller: the regions it lists are
+/// [`RemoteMemoryRegionMetadata`] to pass to
+/// [`RemoteMemoryProvider::get_remote_mr`].
+#[derive(Debug, Clone)]
+pub struct Catalog {
+    regions: Vec<RemoteMemoryRegionMetadata>,
+}
+
+impl Catalog {
+    /// The region catalogued under `name`, or a [`RegionNotFound`].
+    pub fn find_by_name(
+        &self,
+        name: &str,
+    ) -> Result<&RemoteMemoryRegionMetadata, RegionNotFound> {
+        self.regions
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| RegionNotFound {
+                name: name.to_owned(),
+            })
+    }
+
+    /// The regions the catalog carries.
+    pub fn get_vec(&self) -> &Vec<RemoteMemoryRegionMetadata> {
+        &self.regions
+    }
+}
+
+/// No region of a given name in the remote [`Catalog`]: the region
+/// was never registered, or is no longer shared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionNotFound {
+    /// The name that was looked up.
+    pub name: String,
+}
+
+impl fmt::Display for RegionNotFound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the remote catalog has no region named {:?}", self.name)
+    }
+}
+
+impl std::error::Error for RegionNotFound {}
 
 /// An active memory region on the remote machine, as returned by
 /// [`RemoteMemoryProvider::get_remote_mr`].
@@ -897,9 +945,12 @@ impl RemoteMemoryProvider {
         })
     }
 
-    /// Metadata of the remote memory regions known to this provider.
-    pub fn get_remote_mr_metadata(&self) -> Vec<RemoteMemoryRegionMetadata> {
-        self.metadata.borrow().clone()
+    /// The [`Catalog`] of the remote memory regions known to this
+    /// provider.
+    pub fn get_remote_mr_metadata(&self) -> Catalog {
+        Catalog {
+            regions: self.metadata.borrow().clone(),
+        }
     }
 
     /// Refresh the region metadata from the remote machine, for the

@@ -73,7 +73,7 @@ fn test_public_api() {
         synch.synch().unwrap();
         reader.update(0).unwrap(); // session: greet, join group 0, RDMA rendezvous, tuples
         let catalog = reader.get_remote_mr_metadata();
-        let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
+        let region = reader.get_remote_mr(&catalog.get_vec()[0], Some(0)).unwrap();
         let tests = region.read_typed::<Test>(0, 3).unwrap(); // [Test { v: 1 }, Test { v: 2 }, Test { v: 3 }]
         assert_eq!(tests.iter().map(|t| t.v).collect::<Vec<_>>(), vec![1, 2, 3]);
         println!("Done!");

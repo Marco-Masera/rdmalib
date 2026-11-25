@@ -68,7 +68,7 @@ fn test_public_api() {
         synch.synch().unwrap();
         reader.update(0).unwrap(); // session: greet, join group 0, RDMA rendezvous, tuples
         let catalog = reader.get_remote_mr_metadata();
-        let region = reader.get_remote_mr(&catalog[0], Some(0)).unwrap();
+        let region = reader.get_remote_mr(&catalog.get_vec()[0], Some(0)).unwrap();
         // The whole region...
         let whole = region.read(0, expected.len()).unwrap();
         assert_eq!(whole, expected);
