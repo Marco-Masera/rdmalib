@@ -1,6 +1,6 @@
-# RDMA-Lib
+# RDMAlib: a RDMA library for disaggregated memory
 
-Name is temporary. The library is in development.
+The library is currently in active development.
 It provides abstraction to RDMA primitives for Rust applications, specifically for disaggregated memory settings.
 
 # Structure
