@@ -17,7 +17,7 @@ fn reader_reads_what_the_owner_shares() {
         RDMA_PORT,
         TCP_PORT,
     ));
-    let handle = owner.register_typed("readings", vec![42u64, 43, 44]);
+    let handle = owner.register_typed("readings", vec![42u64, 43, 44], false);
     owner.serve().unwrap();
 
     // Reader: join group 0 and read the region back, element by
@@ -27,7 +27,7 @@ fn reader_reads_what_the_owner_shares() {
         RDMA_PORT,
         TCP_PORT,
     ));
-    reader.update(0).unwrap();
+    reader.join_and_fetch(0).unwrap();
     let catalog = reader.get_remote_mr_metadata();
     let regions = catalog.get_vec();
     assert_eq!(regions.len(), 1);
@@ -46,9 +46,9 @@ fn reader_reads_what_the_owner_shares() {
     );
 
     // A region registered after the session started is picked up by
-    // the next update, over the open channel.
-    let late = owner.register_typed("counters", vec![7u32, 8]);
-    reader.update(0).unwrap();
+    // the next join_and_fetch, over the open channel.
+    let late = owner.register_typed("counters", vec![7u32, 8], false);
+    reader.join_and_fetch(0).unwrap();
     let catalog = reader.get_remote_mr_metadata();
     let regions = catalog.get_vec();
     assert_eq!(regions.len(), 2);
@@ -78,7 +78,7 @@ fn reader_writes_what_the_owner_shares() {
         RDMA_PORT,
         TCP_PORT,
     ));
-    let handle = owner.register_typed("commands", vec![0u64, 0, 0, 0]);
+    let handle = owner.register_typed("commands", vec![0u64, 0, 0, 0], false);
     owner.serve().unwrap();
 
     // Reader: join group 0 and write into the region, element-wise
@@ -88,7 +88,7 @@ fn reader_writes_what_the_owner_shares() {
         RDMA_PORT,
         TCP_PORT,
     ));
-    reader.update(0).unwrap();
+    reader.join_and_fetch(0).unwrap();
     let catalog = reader.get_remote_mr_metadata();
     let region = reader.get_remote_mr(&catalog.get_vec()[0], Some(0)).unwrap();
 
@@ -143,12 +143,12 @@ fn staged_and_registered_transfers() {
         TCP_PORT,
     ));
     let bulk: Vec<u32> = (0..BULK_ELEMS as u32).collect();
-    let bulk_handle = owner.register_typed("bulk", bulk.clone());
-    let small_handle = owner.register_typed("small", vec![1u64, 2, 3]);
+    let bulk_handle = owner.register_typed("bulk", bulk.clone(), false);
+    let small_handle = owner.register_typed("small", vec![1u64, 2, 3], false);
     // A byte-shared region for the latency sweep: shared as u8s, its
     // byte API exercises every data path without the element-layout
     // checks rejecting the u8 views of it.
-    owner.register_typed("sweep", vec![0u8; 8192]);
+    owner.register_typed("sweep", vec![0u8; 8192], false);
     owner.serve().unwrap();
 
     let reader = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::new(
@@ -156,11 +156,9 @@ fn staged_and_registered_transfers() {
         RDMA_PORT,
         TCP_PORT,
     ));
-    reader.update(0).unwrap();
-    let catalog = reader.get_remote_mr_metadata();
-    let by_name = |name: &str| catalog.find_by_name(name).unwrap().clone();
-    let bulk_region = reader.get_remote_mr(&by_name("bulk"), Some(0)).unwrap();
-    let small_region = reader.get_remote_mr(&by_name("small"), Some(0)).unwrap();
+    reader.join_and_fetch(0).unwrap();
+    let bulk_region = reader.find_remote_by_name("bulk", 0).unwrap();
+    let small_region = reader.find_remote_by_name("small", 0).unwrap();
 
     // Staged reads: a chunked whole-region one, then slices.
     let whole = bulk_region.read_typed::<u32>(0, BULK_ELEMS).unwrap();
@@ -210,7 +208,7 @@ fn staged_and_registered_transfers() {
     // API promises, the `write` column switches from the inline path
     // to the pool at the granted budget, and the registered columns
     // are the zero-copy floor.
-    let sweep_region = reader.get_remote_mr(&by_name("sweep"), Some(0)).unwrap();
+    let sweep_region = reader.find_remote_by_name("sweep", 0).unwrap();
     let mut sweep_buf = reader.register_buffer(0, vec![0u8; 4096]).unwrap();
     let mut scratch = vec![0u8; 4096];
 
@@ -260,8 +258,9 @@ fn staged_and_registered_transfers() {
 }
 
 /// A registered buffer survives the group's connection being replaced:
-/// when the owner goes away, the reader's next update opens a fresh
-/// session — a new RDMA connection, a new protection domain — and the
+/// when the owner goes away, the reader's next join_and_fetch opens a
+/// fresh session — a new RDMA connection, a new protection domain — and
+/// the
 /// buffer re-registers into it on its next use. Needs RDMA hardware —
 /// run with `cargo test -- --ignored`.
 #[test]
@@ -272,7 +271,7 @@ fn registered_buffers_survive_a_reconnect() {
     let addr = SharedMemoryRegionProviderAddr::new(RDMA_PORT, TCP_PORT);
 
     let owner = SharedMemoryRegionProvider::new(addr);
-    owner.register_typed("values", vec![7u64, 8, 9]);
+    owner.register_typed("values", vec![7u64, 8, 9], false);
     owner.serve().unwrap();
 
     let reader = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::new(
@@ -280,7 +279,7 @@ fn registered_buffers_survive_a_reconnect() {
         RDMA_PORT,
         TCP_PORT,
     ));
-    reader.update(0).unwrap();
+    reader.join_and_fetch(0).unwrap();
     let catalog = reader.get_remote_mr_metadata();
     let region = reader.get_remote_mr(&catalog.get_vec()[0], Some(0)).unwrap();
     let mut buffer = reader.register_buffer_typed(0, vec![0u64; 3]).unwrap();
@@ -288,15 +287,16 @@ fn registered_buffers_survive_a_reconnect() {
     assert_eq!(buffer.as_slice(), &[7, 8, 9]);
 
     // The owner goes away, and comes back with different data. The
-    // reader's open channel is dead: the next update fails and drops
-    // it, and the one after opens a fresh session — with a new RDMA
+    // reader's open channel is dead: the next join_and_fetch fails and
+    // drops it, and the one after opens a fresh session — with a new
+    // RDMA
     // connection and protection domain.
     drop(owner);
     let owner = SharedMemoryRegionProvider::new(addr);
-    let handle = owner.register_typed("values", vec![70u64, 80, 90]);
+    let handle = owner.register_typed("values", vec![70u64, 80, 90], false);
     owner.serve().unwrap();
-    assert!(reader.update(0).is_err());
-    reader.update(0).unwrap();
+    assert!(reader.join_and_fetch(0).is_err());
+    reader.join_and_fetch(0).unwrap();
 
     // The buffer, registered in the old connection's domain,
     // re-registers on use — and works through the new one.

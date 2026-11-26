@@ -281,7 +281,7 @@ pub(crate) fn write_frame(stream: &mut impl Write, msg: &Message) -> io::Result<
 /// but paid twice by a mid-run recovery (the fresh session, then
 /// the tuples re-request that carries the fresh rkey). Observed in
 /// the field as ~45 ms per session and ~90 ms per recovery, both
-/// `update` phases slow and the RDMA-only phases sub-millisecond.
+/// `join_and_fetch` phases slow and the RDMA-only phases sub-millisecond.
 #[derive(Debug)]
 pub(crate) struct Channel {
     stream: TcpStream,

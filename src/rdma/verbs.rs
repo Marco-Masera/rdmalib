@@ -1034,8 +1034,8 @@ impl ProtectionDomain {
     /// device: the bind's CQE fails with `IBV_WC_MW_BIND_ERR`
     /// ("memory management operation error") and the posting queue
     /// pair goes to ERROR, flushing everything after it. Shared
-    /// regions served through windows (see
-    /// `SharedMemoryRegionProvider::serve_through_windows`) register
+    /// regions registered revocable — the `revocable` flag of
+    /// `SharedMemoryRegionProvider::register_typed` — register
     /// their backing this way.
     pub fn register_window_target(&self, addr: u64, size: usize) -> io::Result<MemoryRegion> {
         self.register_access(

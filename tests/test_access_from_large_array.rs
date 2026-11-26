@@ -62,7 +62,7 @@ fn test_public_api() {
             .collect();
 
         // Assign this memory region to the memory Provider. Now it owns it.
-        let handle = owner.register_typed("tests", buffer);
+        let handle = owner.register_typed("tests", buffer, false);
         let result = owner.serve().unwrap();
 
         // Wait for the reader
@@ -95,7 +95,7 @@ fn test_public_api() {
         synch.synch().unwrap();
 
         // This gets metadata from the remote writer
-        reader.update(0).unwrap();
+        reader.join_and_fetch(0).unwrap();
         // Catalog: set of regions shared by the writer - only one in this example
         let catalog = reader.get_remote_mr_metadata();
         // Get the region associated to the area. Some(0) is a self-assigned group for permissions

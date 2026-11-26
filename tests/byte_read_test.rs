@@ -42,7 +42,8 @@ fn test_public_api() {
                 cluster.me().tcp_port,
             )); // RDMA, TCP ports
         let payload: Vec<u8> = (0..64u8).collect();
-        let handle = owner.register(rdmalib::SharedMemoryRegionMetadata::new("raw", payload));
+        let handle =
+            owner.register(rdmalib::SharedMemoryRegionMetadata::new("raw", payload), false);
         owner.serve().unwrap();
         // The provider is listening: let the readers connect.
         synch.synch().unwrap();
@@ -66,7 +67,7 @@ fn test_public_api() {
         let expected: Vec<u8> = (0..64u8).collect();
         // Node0 is serving now.
         synch.synch().unwrap();
-        reader.update(0).unwrap(); // session: greet, join group 0, RDMA rendezvous, tuples
+        reader.join_and_fetch(0).unwrap(); // session: greet, join group 0, RDMA rendezvous, tuples
         let catalog = reader.get_remote_mr_metadata();
         let region = reader.get_remote_mr(&catalog.get_vec()[0], Some(0)).unwrap();
         // The whole region...

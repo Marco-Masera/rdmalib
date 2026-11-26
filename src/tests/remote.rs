@@ -37,9 +37,24 @@ fn provider_starts_empty() {
     let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
     assert!(provider.get_remote_mr_metadata().get_vec().is_empty());
     assert!(provider.get_remote_mr(&metadata("missing", 0, 0), None).is_none());
-    // Nothing connects until an update, and an update without a
+    // Nothing connects until a join_and_fetch, and one without a
     // reachable remote fails here.
-    assert!(provider.update(0).is_err());
+    assert!(provider.join_and_fetch(0).is_err());
+}
+
+#[test]
+fn reconnect_runs_the_session_itself() {
+    let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
+
+    // Not a flag-drop: reconnect establishes a fresh session, all in
+    // this call — on a group no session ever joined, a first session.
+    // No remote is up, so the attempt errs rather than silently
+    // doing nothing.
+    assert!(provider.reconnect(0).is_err());
+
+    // The failed session left the channel dropped — still "fresh
+    // next time" — so the retry is the same call.
+    assert!(provider.reconnect(0).is_err());
 }
 
 #[test]
@@ -112,6 +127,62 @@ fn catalog_find_by_name_and_get_vec() {
         }
     );
     assert_eq!(catalog.get_vec(), &vec![heap]);
+}
+
+#[test]
+fn find_remote_by_name_resolves_and_reports() {
+    let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
+
+    // No session has ever run and no region is catalogued: the name
+    // is simply not there.
+    assert_eq!(
+        provider.find_remote_by_name("heap", 0).unwrap_err(),
+        GetRegionError::NotFound(RegionNotFound {
+            name: "heap".into()
+        })
+    );
+
+    // A catalogued region, but no session for the group has run (as
+    // if no join_and_fetch had succeeded): no binding for the group.
+    let heap = metadata("heap", 7, 12288);
+    provider.metadata.borrow_mut().push(heap.clone());
+    assert_eq!(
+        provider.find_remote_by_name("heap", 0).unwrap_err(),
+        GetRegionError::Unavailable {
+            name: "heap".into(),
+            group: 0
+        }
+    );
+
+    // With the group's binding cached — as a served session leaves
+    // it — the lookup hands out the region.
+    provider.regions.borrow_mut().insert(
+        (heap.name.clone(), heap.id),
+        vec![CachedRegion {
+            remote_addr: 0x1000,
+            size: 4096,
+            rkey: 1,
+            group: 0,
+            elem_size: 1,
+            elem_align: 1,
+            elem_type: "u8".into(),
+        }],
+    );
+    let region = provider.find_remote_by_name("heap", 0).unwrap();
+    assert_eq!(
+        (region.remote_addr, region.rkey, region.group),
+        (0x1000, 1, 0)
+    );
+
+    // The same region through a group that never joined: still
+    // unavailable, with the group named in the error.
+    assert_eq!(
+        provider.find_remote_by_name("heap", 3).unwrap_err(),
+        GetRegionError::Unavailable {
+            name: "heap".into(),
+            group: 3
+        }
+    );
 }
 
 #[test]
@@ -341,10 +412,10 @@ fn staging_capacity_is_configurable() {
 fn register_buffer_needs_a_session_and_a_connection() {
     let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
 
-    // No session for the group yet: an update is needed first.
+    // No session for the group yet: a join_and_fetch is needed first.
     let err = provider.register_buffer(0, vec![0u8; 8]).unwrap_err();
     assert_ne!(err.kind(), io::ErrorKind::InvalidInput);
-    assert!(err.to_string().contains("update"), "{err}");
+    assert!(err.to_string().contains("join_and_fetch"), "{err}");
 
     // A session without a connection (no rendezvous has run): the
     // same story.
@@ -357,7 +428,7 @@ fn register_buffer_needs_a_session_and_a_connection() {
     );
     let err = provider.register_buffer(0, vec![0u8; 8]).unwrap_err();
     assert_ne!(err.kind(), io::ErrorKind::InvalidInput);
-    assert!(err.to_string().contains("update"), "{err}");
+    assert!(err.to_string().contains("join_and_fetch"), "{err}");
 
     // An empty buffer is invalid input, rejected before any of that.
     assert_eq!(

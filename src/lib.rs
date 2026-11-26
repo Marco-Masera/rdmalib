@@ -8,8 +8,8 @@
 //! type — types whose every bit pattern is valid, since remote
 //! machines write arbitrary bytes into them. Reads, writes, and tuple
 //! creation use the low-level layer; the metadata exchange between the
-//! two sides travels over TCP — [`RemoteMemoryProvider::update`] runs a
-//! group's session on the reader side, and the provider serves it
+//! two sides travels over TCP — [`RemoteMemoryProvider::join_and_fetch`]
+//! runs a group's session on the reader side, and the provider serves it
 //! from a background thread ([`SharedMemoryRegionProvider::serve`]).
 
 pub mod rdma;
@@ -26,8 +26,8 @@ pub use providers::{
 };
 pub use rdma::{is_flushed, is_remote_access, is_remote_op};
 pub use readers::{
-    Catalog, RegisteredBuffer, RegionNotFound, RemoteMemoryProvider, RemoteMemoryProviderAddr,
-    RemoteMemoryRegion, RemoteMemoryRegionMetadata,
+    Catalog, GetRegionError, RegisteredBuffer, RegionNotFound, RemoteMemoryProvider,
+    RemoteMemoryProviderAddr, RemoteMemoryRegion, RemoteMemoryRegionMetadata,
 };
 
 #[cfg(test)]

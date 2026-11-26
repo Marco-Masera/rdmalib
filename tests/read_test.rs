@@ -48,7 +48,7 @@ fn test_public_api() {
                 cluster.me().tcp_port,
             )); // RDMA, TCP ports
         let handle =
-            owner.register_typed("tests", vec![Test { v: 1 }, Test { v: 2 }, Test { v: 3 }]);
+            owner.register_typed("tests", vec![Test { v: 1 }, Test { v: 2 }, Test { v: 3 }], false);
         let result = owner.serve().unwrap();
         // The provider is listening: let the readers connect.
         synch.synch().unwrap();
@@ -71,7 +71,7 @@ fn test_public_api() {
         ));
         // Node0 is serving now.
         synch.synch().unwrap();
-        reader.update(0).unwrap(); // session: greet, join group 0, RDMA rendezvous, tuples
+        reader.join_and_fetch(0).unwrap(); // session: greet, join group 0, RDMA rendezvous, tuples
         let catalog = reader.get_remote_mr_metadata();
         let region = reader.get_remote_mr(&catalog.get_vec()[0], Some(0)).unwrap();
         let tests = region.read_typed::<Test>(0, 3).unwrap(); // [Test { v: 1 }, Test { v: 2 }, Test { v: 3 }]

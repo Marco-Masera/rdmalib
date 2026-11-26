@@ -17,8 +17,8 @@ crate::impl_remote_safe!(Reading);
 #[test]
 fn register_assigns_sequential_ids() {
     let provider = provider();
-    let a = provider.register(SharedMemoryRegionMetadata::new("heap", vec![0; 4]));
-    let b = provider.register_typed("counters", vec![0u32; 4]);
+    let a = provider.register(SharedMemoryRegionMetadata::new("heap", vec![0; 4]), false);
+    let b = provider.register_typed("counters", vec![0u32; 4], false);
     // Same name, distinct ids — the id sequence is shared by the byte
     // and the typed entry points.
     assert_eq!((a.id(), b.id()), (0, 1));
@@ -27,7 +27,8 @@ fn register_assigns_sequential_ids() {
 #[test]
 fn tuples_need_an_accepted_group() {
     let provider = provider();
-    let handle = provider.register(SharedMemoryRegionMetadata::new("heap", vec![0u8; 4096]));
+    let handle =
+        provider.register(SharedMemoryRegionMetadata::new("heap", vec![0u8; 4096]), false);
 
     // No reader has been accepted into group 0, so no group exists
     // yet: no tuple is served. (Creating real tuples requires RDMA
@@ -42,7 +43,7 @@ fn tuples_need_an_accepted_group() {
 #[test]
 fn buffer_read_write_via_handle() {
     let provider = provider();
-    let handle = provider.register(SharedMemoryRegionMetadata::new("heap", vec![1, 2, 3, 4]));
+    let handle = provider.register(SharedMemoryRegionMetadata::new("heap", vec![1, 2, 3, 4]), false);
 
     assert_eq!(*handle.borrow(), [1, 2, 3, 4]);
     handle.borrow_mut()[0] = 9;
@@ -52,7 +53,7 @@ fn buffer_read_write_via_handle() {
 #[test]
 fn provider_usable_while_buffer_borrowed() {
     let provider = provider();
-    let a = provider.register(SharedMemoryRegionMetadata::new("a", vec![0; 8]));
+    let a = provider.register(SharedMemoryRegionMetadata::new("a", vec![0; 8]), false);
 
     let mut buf = a.borrow_mut();
     buf[0] = 1;
@@ -61,7 +62,7 @@ fn provider_usable_while_buffer_borrowed() {
     // working while the application holds a mutable borrow: it
     // registers regions and serves tuple lookups. (No reader has been
     // accepted, so no tuple is available yet.)
-    let b = provider.register(SharedMemoryRegionMetadata::new("b", vec![0; 8]));
+    let b = provider.register(SharedMemoryRegionMetadata::new("b", vec![0; 8]), false);
     assert!(provider.get_shared_mr(b.id(), 0).unwrap().is_none());
     assert_eq!(*b.borrow(), [0; 8]);
     drop(buf);
@@ -87,7 +88,7 @@ fn typed_regions_are_shared_without_copying() {
     let expected = readings.clone();
     let before = readings.as_ptr();
 
-    let handle = provider.register_typed("readings", readings);
+    let handle = provider.register_typed("readings", readings, false);
 
     // The Vec was moved, not copied: the same heap allocation.
     assert_eq!(handle.borrow().as_ptr(), before);
@@ -100,7 +101,7 @@ fn typed_regions_are_shared_without_copying() {
 #[test]
 fn typed_regions_serve_tuples_like_byte_regions() {
     let provider = provider();
-    let handle = provider.register_typed::<u32>("counters", vec![7, 7, 7, 7]);
+    let handle = provider.register_typed::<u32>("counters", vec![7, 7, 7, 7], false);
 
     // Tuples are built from the captured byte address and size, so a
     // 16-byte Vec of four u32s is served exactly like a byte region.
@@ -109,18 +110,19 @@ fn typed_regions_serve_tuples_like_byte_regions() {
 }
 
 #[test]
-fn windowed_regions_need_a_real_region() {
+fn revocable_regions_serve_nothing_without_a_group() {
     let provider = provider();
+    let handle = provider.register(
+        SharedMemoryRegionMetadata::new("secret", vec![0u8; 512]),
+        true,
+    );
+    let plain = provider.register(SharedMemoryRegionMetadata::new("plain", vec![0; 8]), false);
 
-    // The marking names a region that must exist.
-    assert!(provider.serve_through_windows(99).is_err());
-}
-
-#[test]
-fn windowed_regions_serve_nothing_without_a_group() {
-    let provider = provider();
-    let handle = provider.register(SharedMemoryRegionMetadata::new("secret", vec![0u8; 512]));
-    provider.serve_through_windows(handle.id()).unwrap();
+    // The flag is captured at registration, and nowhere else: the
+    // revocable region's grants will be window bindings, the plain
+    // one's registrations.
+    assert!(provider.region_windowed(handle.id()));
+    assert!(!provider.region_windowed(plain.id()));
 
     // No reader has been accepted into group 0, so no group — and no
     // binding — exists: the windowed path never posts a bind. (The
@@ -132,8 +134,10 @@ fn windowed_regions_serve_nothing_without_a_group() {
 #[test]
 fn revoking_without_a_grant_is_trivially_done() {
     let provider = provider();
-    let handle = provider.register(SharedMemoryRegionMetadata::new("secret", vec![0u8; 512]));
-    provider.serve_through_windows(handle.id()).unwrap();
+    let handle = provider.register(
+        SharedMemoryRegionMetadata::new("secret", vec![0u8; 512]),
+        true,
+    );
 
     // A group that never materialized a binding has no access at
     // all: revoking is a no-op, granting is left to the lazy binding
@@ -151,5 +155,5 @@ fn zero_sized_elements_are_rejected() {
     crate::impl_remote_safe!(Empty);
 
     let provider = provider();
-    let _ = provider.register_typed("empty", vec![Empty; 3]);
+    let _ = provider.register_typed("empty", vec![Empty; 3], false);
 }

@@ -5,11 +5,11 @@ It provides abstraction to RDMA primitives for Rust applications, specifically f
 
 # Structure
 
-Targeting DM settings, the library is asimmetrical, separating who offers its local memory remotely, and who accesses it:
+Targeting DM settings, the library is asimmetrical, separating who offers its local memory remotely (the **Provider**), and who accesses it (the **Client**):
 * `SharedMemoryRegionProvider` -> A construct that allows processes to share parts of their local memory.
-* `RemoteMemoryRegion` -> A construc that allows to access remote regions.
+* `RemoteMemoryRegion` -> A construct that allows to access remote regions.
 
-That said, nothing forbids a single Node to play both roles.
+That said, nothing forbids a single Node to play both roles, by creating instances of both constructs.
 
 # Usage
 
@@ -43,7 +43,8 @@ let mut buffer = vec![MyDataType; 256];
 // Share it 
 let handle: SharedMemoryRegionHandle<MyDataType> shared_memory_provider.register_typed(
     "MyBuffer", //Name for the memory region
-    buffer // Now buffer is owned by the SharedMemoryRegionProvider
+    buffer, // Now buffer is owned by the SharedMemoryRegionProvider
+    false // access is not revocable
 );
 ```
 
@@ -59,12 +60,10 @@ let memory_node_addr = RemoteMemoryProviderAddr::new(
     2020, // TCP port of the owner
 )
 let remote_memory = RemoteMemoryProvider::new();
-remote_memory.update(0)?; // Join a group, refresh the metadata
-let catalog = remote_memory.get_remote_mr_metadata(); // get the metadata 
+remote_memory.join_and_fetch(0)?; // Join a group, fetch metadata
 
-// Connect to a region - using the region name
-let region_metadata = catalog.find_by_name("MyBuffer".as_ref())?;
-let region: RemoteMemoryRegion = remote_memory.get_remote_mr(region_metadata, Some(0))
+// Connect to a region using the region name
+let region: RemoteMemoryRegion = remote_memory.find_remote_by_name("MyBuffer", 0)?;
 ```
 
 With `RemoteMemoryRegion`, the process can read remote memory:
@@ -92,15 +91,33 @@ let to_write: &[MyDataType] = & [
 region.write_typed(10, to_write);
 ```
 
-## Revocable access
+## Registered buffers: zero-copy reads and writes
 
-By default a region's grant to a group is a plain registration, live
-for the provider's lifetime. A region can instead be served through
-**memory windows** — one type-1 window per group, bound over the
-region's memory, revocable and re-grantable:
+Every read and write above passes through a small internal scratch buffer, causing one extra local copy per operation.
+An application that accesses a region at high frequency can skip it: register a buffer **once** with `register_buffer_typed`, and the *registered* APIs read and write the remote memory straight into and out of it, with no copy per operation.
+
+The registration pins the buffer's pages, and the buffer follows the group's connection across its re-establishments — it re-registers itself on first use, so recoveries need no bookkeeping.
 
 ```rust
-owner.serve_through_windows(handle.id())?; // before any session serves the region
+// Register a local buffer
+let mut buf = remote_memory.register_buffer_typed(
+    0,
+    vec![MyDataType { v: 0, fixed_size_string: [0; 64] }; 16],
+)?;
+region.read_into_registered(0, 16, &mut buf)?;   // remote data lands directly in buf
+region.write_from_registered(0, 16, &buf)?;      // remote memory is written directly from it
+```
+
+## Revocable access
+
+Permission management and revocation is managed through **groups**.
+As shown in the examples above, the client needs to join at least one group before accessing regions: `remote_memory.join_and_fetch(GROUP)`, and then specifies a group again when accessing the region: `remote_memory.find_remote_by_name("MyBuffer", GROUP)`
+
+When a region is registered as revocable, the provider can then set permissions at group-level.
+
+```rust
+// A region registered as revocable
+let handle = shared_memory_provider.register_typed("MyBuffer", buffer, true);
 ...
 // Revoke group 5's access: returns only after the window's
 // zero-length bind *completed* at the device — from that point no
@@ -111,7 +128,7 @@ owner.revoke_region(handle.id(), 5)?;
 ...
 // Re-grant: the window binds over the full range again, under a
 // fresh rkey (the old one never revives) the group picks up by
-// re-requesting its tuples (reader.update).
+// re-requesting its tuples (reader.join_and_fetch).
 owner.grant_region(handle.id(), 5)?;
 ```
 
@@ -119,85 +136,68 @@ A revoked group keeps being served its — now dead — rkey, so its
 operations fail with a remote access violation a consumer can
 classify (`rdmalib::is_remote_access`; the flush that follows a
 failed queue pair is `rdmalib::is_flushed`) instead of the region
-vanishing from its catalog. A reader whose connection died (a
-revocation kills the queue pair) re-establishes it with
-`reader.reconnect(group)`: the next `update` runs a fresh session,
-replacing the connection inside the same group.
-
-## Word-level alignment
-
-RDMA one-sided accesses are **atomic at the machine-word level** when
-both the address and the size of the access are naturally aligned — a
-multiple of 8 bytes on typical 64-bit hardware. An aligned 8-byte
-access is never observed half-done by the other side; an unaligned or
-odd-sized one can be, while a remote reader/writer is concurrently
-active on the same area. (Atomicity holds per aligned word: a larger
-transfer is performed as a series of word-sized units, so the transfer
-as a whole is *not* atomic.)
-
-Word alignment is **not required** — every API in this library works
-with any byte offset and size within the region's bounds, and nothing
-enforces multiples of 8. Sharing a `Vec` of 12-byte structs and
-reading at offset 3 is fine; it merely forgoes word-level atomicity.
-Think of it as a convention for data that remote readers and writers
-may access concurrently, not a rule of the library.
-
-### How to ensure it
-
-Everything follows from one property — **the element type's alignment
-is at least 8** — plus word-aligned offsets:
-
-1. **Give the type an alignment of ≥ 8.** A `Vec`'s allocation is
-   guaranteed aligned to `align_of::<T>()`, and nothing stronger, so
-   this is what makes the region's *base address* 8-aligned. In
-   practice glibc's allocator returns 16-aligned pointers on x86-64,
-   but don't rely on that: guarantee it with a naturally aligned field
-   (`u64`, `f64`, `usize`) or explicitly with `#[repr(C, align(8))]`.
-   Never use `#[repr(packed)]` for types meant to be word-atomic.
-2. **The element size follows automatically.** `size_of::<T>()` is
-   always a multiple of `align_of::<T>()`, so an 8-aligned type is
-   also a multiple of 8 bytes in size (tail padding is inserted for
-   you) — every element boundary stays word-aligned. A 12-byte struct
-   can only exist because its alignment is ≤ 4.
-3. **Use offsets that are multiples of 8.** With an 8-aligned base,
-    those are the absolute word boundaries. For typed reads the offset
-    is in elements: element `i` starts at `i * size_of::<T>()`, already
-    a multiple of 8 given the two rules above.
-
-For typed reads, the library double-checks rule 3:
-[`read_typed`](src/readers.rs) and `read_into_typed` reject a region
-base not aligned to `align_of::<T>()` (element offsets always land on
-element boundaries), so with an 8-aligned `T` the typed API cannot
-express a misaligned access. That is a safety net against accidents,
-not an atomicity mechanism — the byte-level `read`/`read_into` accept
-any offset and size.
-
-### The buffer is exactly the elements
-
-A `Vec`'s metadata (pointer, length, capacity) lives in the `Vec`
-value itself, outside the data allocation — the registered region is
-exactly the elements, contiguous, starting at the address captured at
-registration. No inline header shifts element positions; allocator
-bookkeeping, if any, sits *before* the registered address, not inside
-it.
-
-### Example
+vanishing from its catalog. 
+A revocation kills the queue pair. A client that gets its permissions back must re-establish it with `reader.reconnect(group)`.
 
 ```rust
-/// Word-atomic by construction: `align(8)` gives the region an
-/// 8-aligned base, and the size rounds up to 16 bytes (a multiple
-/// of 8), so every element sits on word boundaries.
-#[repr(C, align(8))]
-#[derive(Clone, Copy)]
-struct Reading {
-    timestamp: u64,
-    value: f32, // 4 bytes of tail padding follow, implied
+// A client registers in group 5
+dm.join_and_fetch(5)?;
+let mut region = dm.find_remote_by_name("RemoteRegionName", 5)?;
+// then it tries to read 
+match region.read_into_typed(0, &mut buffer) {
+    Ok(()) => {} // Read succeeded, and data is in buffer
+    Err(e) if rdmalib::is_remote_access(&e) || rdmalib::is_remote_op(&e) => {
+        // Permission was revoked!
+        // ...must ask the provider to grant permission back, outside the library scope...
+        // after permissions are granted:
+        dm.reconnect(5)?; // Run a fresh session: new QP, fresh rkey fetched
+        region = dm.find_remote_by_name("RemoteRegionName", 5)?; // fresh rkey, same name
+        
+    }
+    Err(e) => return Err(e), // Other error
 }
-rdmalib::impl_remote_safe!(Reading);
-
-// Provider side: the base is 8-aligned, elements are 16 bytes apart.
-let handle = provider.register_typed("readings", vec![Reading { timestamp: 0, value: 0.0 }; 100]);
-
-// Reader side: offset in elements — here, element 3.
-let r = region.read_typed::<Reading>(3, 1)?;
 ```
+
+## Raw bytes APIs
+
+The APIs described so far accept a type T, and shared memory regions are logical arrays of type T.
+The raw bytes APIs instead allow to share buffers of bytes with no type enforcement.
+
+Provider side: register raw bytes.
+
+```rust
+let handle = shared_memory_provider.register(
+    SharedMemoryRegionMetadata::new("MyBuffer", vec![0u8; 4096]),
+    false,
+);
+handle.borrow_mut()[0] = 1; // &mut [u8]
+```
+
+Reader side: the same groups and lookups, but offsets and lengths count bytes, and no element layout travels or is checked.
+
+```rust
+remote_memory.join_and_fetch(0)?;
+let region = remote_memory.find_remote_by_name("MyBuffer", 0)?;
+
+let head: Vec<u8> = region.read(0, 4)?;      // first 4 bytes, allocated for you
+region.read_into(0, 4, &mut scratch)?;       // into a buffer you already own
+region.write(4, &[0u8; 4])?;                 // one-sided write, any size that fits
+```
+
+The zero-copy paths have byte flavors too — a registered buffer, then
+registered reads and writes:
+
+```rust
+let mut buf = remote_memory.register_buffer(0, vec![0u8; 4096])?;
+region.read_into_registered(0, 4096, &mut buf)?;
+region.write_from_registered(0, 4096, &buf)?;
+```
+
+# Word-level alignment
+
+RDMA one-sided accesses are **atomic at the machine-word level** when both the address and the size of the access are naturally aligned.
+
+The library itself does not enforce word-level alignment when sharing a raw bytes buffer: the client is allowed to read and write at any offset and length. On the contrary, alignment is **enforced** when using the typed API.
+
+If the user wants to enforce word-level alignment:
+**Give the type T an alignment of ≥ 8.**. Already satisfied for naturally aligned fields (`u64`, `f64`, `usize`), and can be enforced on custom data types with `#[repr(C, align(8))]`

@@ -105,9 +105,9 @@ type Owner = Rc<RefCell<Box<dyn Any>>>;
 /// open session at any time.
 ///
 /// A region's grant to a group is a plain registration — forever,
-/// for the provider's lifetime — unless the region is marked
-/// [`Self::serve_through_windows`]: then each group's tuple carries
-/// a memory window's rkey instead, which
+/// for the provider's lifetime — unless the region is registered
+/// `revocable` ([`Self::register_typed`]): then each group's tuple
+/// carries a memory window's rkey instead, which
 /// [`Self::revoke_region`]/[`Self::grant_region`] can kill or re-grant
 /// with a completion-linearized bind.
 #[derive(Debug)]
@@ -168,9 +168,10 @@ struct RegionInfo {
     /// `std::any::type_name` of the element type, for diagnostics.
     elem_type: String,
     /// Whether the region is served to each group through a
-    /// revocable memory window (see
-    /// [`SharedMemoryRegionProvider::serve_through_windows`]) instead
-    /// of a plain registration.
+    /// revocable memory window — the `revocable` flag of
+    /// [`SharedMemoryRegionProvider::register_typed`] — instead of a
+    /// plain registration. Captured at registration and never
+    /// revisited: a region is born revocable or never.
     windowed: bool,
 }
 
@@ -191,9 +192,10 @@ struct GroupEntry {
     /// The group's accepted reader connections.
     connections: Vec<rdma::Connection>,
     /// The group's bindings by region id: how each region it can see
-    /// is accessed — a plain registration, or, for a region marked
-    /// windowed, a revocable window. Created lazily by the group's
-    /// tuple requests, kept alive until the provider is dropped.
+    /// is accessed — a plain registration, or, for a region
+    /// registered revocable, a window binding. Created lazily by the
+    /// group's tuple requests, kept alive until the provider is
+    /// dropped.
     bindings: HashMap<u32, GroupBinding>,
 }
 
@@ -328,14 +330,19 @@ impl SharedMemoryRegionProvider {
 
     /// Take ownership of `metadata` and assign the region a fresh id.
     ///
-    /// The byte-flavored entry point; see [`Self::register_typed`] for
-    /// sharing a `Vec` of some other element type. Returns a handle
-    /// for continued access to the buffer; the assigned id is
-    /// available as [`SharedMemoryRegionHandle::id`]. No tuples are
-    /// created here: they materialize when a reader's session is
-    /// served, one per (region, group) pair.
-    pub fn register(&self, metadata: SharedMemoryRegionMetadata) -> SharedMemoryRegionHandle {
-        self.register_typed(metadata.name, metadata.buffer)
+    /// The byte-flavored entry point; the `revocable` flag and all
+    /// other semantics are those of [`Self::register_typed`], the one
+    /// implementation. Returns a handle for continued access to the
+    /// buffer; the assigned id is available as
+    /// [`SharedMemoryRegionHandle::id`]. No tuples are created here:
+    /// they materialize when a reader's session is served, one per
+    /// (region, group) pair.
+    pub fn register(
+        &self,
+        metadata: SharedMemoryRegionMetadata,
+        revocable: bool,
+    ) -> SharedMemoryRegionHandle {
+        self.register_typed(metadata.name, metadata.buffer, revocable)
     }
 
     /// Take ownership of a `Vec` of `T`s and assign the region a fresh
@@ -353,6 +360,20 @@ impl SharedMemoryRegionProvider {
     /// for [`Self::register`], from the byte address and size captured
     /// here, so the buffer is never touched by tuple creation.
     ///
+    /// With `revocable`, the region's grant to each group is a
+    /// **memory window** instead of a plain registration: the tuple a
+    /// session serves for it carries its group's window rkey —
+    /// revocable with [`Self::revoke_region`] (a zero-length bind,
+    /// complete when it returns) and re-grantable with
+    /// [`Self::grant_region`] (a fresh rkey the group picks up by
+    /// re-requesting its tuples). Without it the grant is a plain
+    /// registration, live for the provider's lifetime. The flag is
+    /// fixed here, at registration — a region is born revocable or
+    /// never, so no session can materialize a plain grant first:
+    /// which regions are revocable is the application's policy, while
+    /// the *act* of revoking stays an explicit call, never a side
+    /// effect.
+    ///
     /// # Panics
     ///
     /// Panics if `T` is zero-sized: such a region has no bytes to
@@ -361,6 +382,7 @@ impl SharedMemoryRegionProvider {
         &self,
         name: impl Into<String>,
         buffer: Vec<T>,
+        revocable: bool,
     ) -> SharedMemoryRegionHandle<T> {
         assert!(
             size_of::<T>() > 0,
@@ -388,7 +410,7 @@ impl SharedMemoryRegionProvider {
                 elem_size: size_of::<T>() as u32,
                 elem_align: align_of::<T>() as u32,
                 elem_type: type_name::<T>().to_owned(),
-                windowed: false,
+                windowed: revocable,
             },
         );
         handle
@@ -416,52 +438,6 @@ impl SharedMemoryRegionProvider {
         self.shared.tuple_of(id, group)
     }
 
-    /// Serve region `id`'s memory to each group through a revocable
-    /// memory window instead of a plain registration.
-    ///
-    /// From the marking on, the tuple every session serves for the
-    /// region is its group's *window* rkey: revocable with
-    /// [`Self::revoke_region`] — the window binds to zero length,
-    /// so its rkey fails every access with a remote access violation
-    /// (the failure a consumer can classify) — and re-grantable with
-    /// [`Self::grant_region`], which binds the full range again
-    /// under a fresh rkey the group picks up by re-requesting its
-    /// tuples.
-    ///
-    /// Mark the region before the first session serves it: a group
-    /// whose tuple was already created as a plain registration keeps
-    /// that grant, which marking then refuses loudly. The marking is
-    /// the application's policy — which regions are revocable is not
-    /// the provider's to decide — while the *act* of revoking stays
-    /// an explicit call, never a side effect.
-    pub fn serve_through_windows(&self, id: u32) -> io::Result<()> {
-        // Served bindings live in their groups; an existing one for
-        // this region means a session already materialized its grant
-        // as a plain registration. The check happens before the
-        // marking, so a race between the two is a policy decision
-        // made twice — the marking still refuses.
-        let served = self
-            .shared
-            .groups
-            .lock()
-            .unwrap()
-            .values()
-            .any(|entry| entry.bindings.contains_key(&id));
-        if served {
-            return Err(io::Error::other(format!(
-                "region {id} already has served tuples; mark it windowed before its first session"
-            )));
-        }
-        let mut catalog = self.shared.catalog.lock().unwrap();
-        let Some(info) = catalog.get_mut(&id) else {
-            return Err(io::Error::other(format!(
-                "no region with id {id} is registered"
-            )));
-        };
-        info.windowed = true;
-        Ok(())
-    }
-
     /// Revoke `group`'s access to region `id`, and report when the
     /// revocation is *complete*.
     ///
@@ -479,7 +455,7 @@ impl SharedMemoryRegionProvider {
     /// it can ask for a re-grant), and [`Self::grant_region`]
     /// re-enables access under a fresh rkey. A group that never got
     /// a tuple has nothing to revoke — trivially revoked. A region
-    /// served as a plain registration cannot be revoked this way,
+    /// registered non-revocable cannot be revoked this way,
     /// and revoking through a *failed queue pair* cannot take
     /// effect: the window's bind work request is flushed with the
     /// queue pair, reported as an error, and the previous binding
@@ -502,6 +478,21 @@ impl SharedMemoryRegionProvider {
     /// reported as an error to retry.
     pub fn grant_region(&self, id: u32, group: u32) -> io::Result<()> {
         self.shared.window_operation(id, group, WindowOperation::Grant)
+    }
+
+    /// Whether region `id`'s grants are window bindings — the
+    /// `revocable` flag captured at registration, the only place it
+    /// is ever set. No binding is created here: the window
+    /// materializes when a session first serves the region.
+    #[cfg(test)]
+    pub(crate) fn region_windowed(&self, id: u32) -> bool {
+        self.shared
+            .catalog
+            .lock()
+            .unwrap()
+            .get(&id)
+            .expect("the region is registered")
+            .windowed
     }
 }
 
@@ -574,8 +565,8 @@ impl Shared {
     ///
     /// Creating the binding registers the region's buffer in the
     /// group's protection domain — a plain registration, or, for a
-    /// region marked windowed, a type 1 window bound over it — and
-    /// the binding is kept alive for as long as the provider is, so
+    /// region registered revocable, a type 1 window bound over it —
+    /// and the binding is kept alive for as long as the provider is, so
     /// repeated requests return its tuple. The buffer is never
     /// touched: its address and size were captured at registration
     /// time. The catalog is consulted first and released, then
@@ -658,8 +649,8 @@ impl GroupBinding {
     fn bind(&self, entry: &mut GroupEntry, grant: bool) -> io::Result<()> {
         let Some((window, backing)) = self.window() else {
             return Err(io::Error::other(
-                "the region is served as a plain registration; \
-                 only windowed regions can be revoked or granted",
+                "the region is registered non-revocable; \
+                 only revocable regions can be revoked or granted",
             ));
         };
         if grant {

@@ -3,7 +3,7 @@
 //! [`RemoteMemoryProvider`] connects to a remote
 //! [`SharedMemoryRegionProvider`](crate::SharedMemoryRegionProvider)
 //! and hands out [`RemoteMemoryRegion`]s to read from and write to.
-//! [`RemoteMemoryProvider::update`] runs a group's session over the
+//! [`RemoteMemoryProvider::join_and_fetch`] runs a group's session over the
 //! metadata channel — greeting, joining the group, connecting over
 //! RDMA (which the remote accepts into the group's protection
 //! domain), and receiving the region catalog and the group's tuples.
@@ -49,10 +49,10 @@ fn clamp_staging_capacity(bytes: usize) -> usize {
 
 /// The error a data operation reports when its group has no RDMA
 /// connection: a session — a successful
-/// [`RemoteMemoryProvider::update`] — is a prerequisite.
+/// [`RemoteMemoryProvider::join_and_fetch`] — is a prerequisite.
 fn no_connection() -> io::Error {
     io::Error::other(
-        "the group has no RDMA connection: a successful update is required first",
+        "the group has no RDMA connection: a successful join_and_fetch is required first",
     )
 }
 
@@ -87,14 +87,15 @@ impl RemoteMemoryProviderAddr {
 /// Handle to the memory regions exported by a remote machine.
 ///
 /// Constructed from a [`RemoteMemoryProviderAddr`];
-/// [`Self::update`] runs a group's session with the remote — the RDMA
+/// [`Self::join_and_fetch`] runs a group's session with the remote — the RDMA
 /// connection of the group is established as part of it, so nothing
-/// connects until the first update, keeping construction infallible.
+/// connects until the first join_and_fetch, keeping construction
+/// infallible.
 #[derive(Debug)]
 pub struct RemoteMemoryProvider {
     /// Where to reach the remote machine.
     addr: RemoteMemoryProviderAddr,
-    /// Sessions by group, established by [`Self::update`]: the
+    /// Sessions by group, established by [`Self::join_and_fetch`]: the
     /// metadata channel, kept open for re-requests, and the group's
     /// RDMA connection.
     pub(crate) sessions: RefCell<HashMap<u32, GroupSession>>,
@@ -116,8 +117,8 @@ pub struct RemoteMemoryProvider {
 #[derive(Debug)]
 pub(crate) struct GroupSession {
     /// The metadata channel, connected by the group's first
-    /// [`RemoteMemoryProvider::update`]; dropped when an exchange
-    /// fails, so the next update opens a fresh session.
+    /// [`RemoteMemoryProvider::join_and_fetch`]; dropped when an exchange
+    /// fails, so the next join_and_fetch opens a fresh session.
     pub(crate) channel: Option<Channel>,
     /// The group's RDMA connection, established by the session's
     /// rendezvous; the group's regions read through it.
@@ -160,7 +161,7 @@ pub(crate) struct GroupConnection {
     /// configuration at creation time.
     pub(crate) capacity: usize,
     /// Bumped whenever the connection is replaced (by a fresh session
-    /// in [`RemoteMemoryProvider::update`]): the staging pool is
+    /// in [`RemoteMemoryProvider::join_and_fetch`]): the staging pool is
     /// dropped with the old connection, and registered buffers see
     /// the bump and re-register into the new connection's domain.
     pub(crate) generation: u32,
@@ -168,7 +169,7 @@ pub(crate) struct GroupConnection {
 
 impl GroupConnection {
     /// A slot no session has filled yet: reads through it fail — a
-    /// successful [`RemoteMemoryProvider::update`] of the group is
+    /// successful [`RemoteMemoryProvider::join_and_fetch`] of the group is
     /// needed first.
     pub(crate) fn empty() -> Self {
         Self::with_capacity(DEFAULT_STAGING_CAPACITY)
@@ -351,7 +352,7 @@ pub struct RemoteMemoryRegionMetadata {
 }
 
 /// The catalog of the memory regions a remote machine has shared, as
-/// of this provider's last [`RemoteMemoryProvider::update`].
+/// of this provider's last [`RemoteMemoryProvider::join_and_fetch`].
 ///
 /// A snapshot owned by the caller: the regions it lists are
 /// [`RemoteMemoryRegionMetadata`] to pass to
@@ -397,12 +398,39 @@ impl fmt::Display for RegionNotFound {
 
 impl std::error::Error for RegionNotFound {}
 
+/// Why [`RemoteMemoryProvider::find_remote_by_name`] cannot hand out a
+/// region: no region of that name in the catalog, or the region has
+/// no binding for the group asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GetRegionError {
+    /// No region catalogued under the name.
+    NotFound(RegionNotFound),
+    /// The region is catalogued but has no binding for the group —
+    /// a [`RemoteMemoryProvider::join_and_fetch`] of the group
+    /// materializes one.
+    Unavailable { name: String, group: u32 },
+}
+
+impl fmt::Display for GetRegionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound(error) => write!(f, "{error}"),
+            Self::Unavailable { name, group } => write!(
+                f,
+                "region {name:?} has no binding for group {group}: a join_and_fetch of the group is needed first"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GetRegionError {}
+
 /// An active memory region on the remote machine, as returned by
 /// [`RemoteMemoryProvider::get_remote_mr`].
 ///
 /// Reads and writes go through the RDMA connection of the region's
 /// group — established by that group's
-/// [`RemoteMemoryProvider::update`] — as bytes ([`Self::read`],
+/// [`RemoteMemoryProvider::join_and_fetch`] — as bytes ([`Self::read`],
 /// [`Self::read_into`], [`Self::write`]) or as elements of any
 /// [`RemoteSafe`] type ([`Self::read_typed`], [`Self::read_into_typed`],
 /// [`Self::write_typed`]), provided that is the type the sharing side
@@ -727,7 +755,7 @@ impl RemoteMemoryRegion {
 /// The buffer never moves or reallocates: the registration pins its
 /// address. If the group's connection is replaced — a fresh session
 /// after the old one failed, run by
-/// [`RemoteMemoryProvider::update`] — the registration is remade in
+/// [`RemoteMemoryProvider::join_and_fetch`] — the registration is remade in
 /// the new connection's protection domain on the next use. `T`
 /// follows the library's element rules: a [`RemoteSafe`] type,
 /// matching the layout the sharing side registered the region as.
@@ -816,7 +844,7 @@ impl<T> fmt::Debug for RegisteredBuffer<T> {
 impl RemoteMemoryProvider {
     /// Prepare a provider for the remote machine described by `addr`.
     ///
-    /// Nothing connects here: the first [`Self::update`] runs a
+    /// Nothing connects here: the first [`Self::join_and_fetch`] runs a
     /// session — the metadata exchange and the group's RDMA
     /// connection. Group connections get staging pools of 1 MiB;
     /// tune that with [`Self::with_staging_capacity`].
@@ -872,7 +900,7 @@ impl RemoteMemoryProvider {
     /// of the caller's memory; larger ones copy through the group
     /// connection's staging pool (see [`RemoteMemoryRegion::write`]).
     /// The budget is granted when the group's session runs its
-    /// rendezvous, so a group that has not updated yet has none to
+    /// rendezvous, so a group that has not joined yet has none to
     /// report.
     pub fn inline_cap(&self, group: u32) -> io::Result<usize> {
         let connection = self
@@ -882,7 +910,7 @@ impl RemoteMemoryProvider {
             .map(|session| Rc::clone(&session.connection))
             .ok_or_else(|| {
                 io::Error::other(
-                    "the group has no session: a successful update is required first",
+                    "the group has no session: a successful join_and_fetch is required first",
                 )
             })?;
         let slot = connection.borrow();
@@ -899,7 +927,7 @@ impl RemoteMemoryProvider {
     /// [`RemoteMemoryRegion::write_from_registered`] — the device
     /// moves data straight between the region and the buffer, with no
     /// per-call registration and no staging copy. The group's session
-    /// must have run — a successful [`Self::update`]: the
+    /// must have run — a successful [`Self::join_and_fetch`]: the
     /// registration is made in the group connection's protection
     /// domain, which the session's rendezvous creates. An empty
     /// buffer cannot be registered. For a buffer of another element
@@ -927,7 +955,7 @@ impl RemoteMemoryProvider {
             .map(|session| Rc::clone(&session.connection))
             .ok_or_else(|| {
                 io::Error::other(
-                    "the group has no session: a successful update is required first",
+                    "the group has no session: a successful join_and_fetch is required first",
                 )
             })?;
         let slot = connection.borrow_mut();
@@ -953,8 +981,34 @@ impl RemoteMemoryProvider {
         }
     }
 
-    /// Refresh the region metadata from the remote machine, for the
-    /// tuples of `group`.
+    /// The region catalogued under `name`, with its binding for
+    /// `group` — the region the provider serves to that group.
+    ///
+    /// Joins nothing: the group's session — a successful
+    /// [`Self::join_and_fetch`] — must have run first, or the lookup
+    /// fails ([`GetRegionError::Unavailable`]); a name the remote
+    /// never registered fails as [`GetRegionError::NotFound`]. The
+    /// first catalog entry of that name wins, as in
+    /// [`Catalog::find_by_name`]. For lookups by id, over a snapshot
+    /// of the whole catalog, see [`Self::get_remote_mr_metadata`] and
+    /// [`Self::get_remote_mr`].
+    pub fn find_remote_by_name(
+        &self,
+        name: &str,
+        group: u32,
+    ) -> Result<RemoteMemoryRegion, GetRegionError> {
+        let catalog = self.get_remote_mr_metadata();
+        let metadata = catalog
+            .find_by_name(name)
+            .map_err(GetRegionError::NotFound)?;
+        self.get_remote_mr(metadata, Some(group)).ok_or(GetRegionError::Unavailable {
+            name: name.to_owned(),
+            group,
+        })
+    }
+
+    /// Join `group` and fetch the region metadata from the remote
+    /// machine, for the tuples of `group`.
     ///
     /// Runs (or reuses) the group's session over the metadata channel:
     /// a fresh session greets the remote, joins the group, and
@@ -972,11 +1026,11 @@ impl RemoteMemoryProvider {
     /// A fresh session replaces the group's RDMA connection: the
     /// connection's staging pool is dropped with it, and registered
     /// buffers re-register into the new connection's protection
-    /// domain on their next use. [`Self::reconnect`] forces this
-    /// fresh-session path — the recovery for a group whose connection
-    /// has failed, which a healthy channel would otherwise never
-    /// replace.
-    pub fn update(&self, group: u32) -> io::Result<()> {
+    /// domain on their next use. [`Self::reconnect`] drops the open
+    /// channel and runs this fresh-session path — the recovery for a
+    /// group whose connection has failed, which a healthy channel
+    /// would otherwise never replace.
+    pub fn join_and_fetch(&self, group: u32) -> io::Result<()> {
         let mut sessions = self.sessions.borrow_mut();
         let session = sessions.entry(group).or_insert_with(|| GroupSession {
             channel: None,
@@ -990,8 +1044,8 @@ impl RemoteMemoryProvider {
                 Ok(exchange) => self.ingest(group, exchange),
                 Err(e) => {
                     // The channel is dead — the remote went away or
-                    // the exchange broke — so the next update opens a
-                    // fresh session.
+                    // the exchange broke — so the next join_and_fetch
+                    // opens a fresh session.
                     session.channel = None;
                     Err(e)
                 }
@@ -1046,27 +1100,35 @@ impl RemoteMemoryProvider {
         }
     }
 
-    /// Forget `group`'s open session, so the next [`Self::update`]
-    /// establishes a fresh one from scratch.
+    /// Forget `group`'s open channel and run a fresh session to
+    /// completion: the recovery for a failed connection, in one
+    /// call.
     ///
     /// A fresh session is a new metadata exchange *and* a new RDMA
     /// connection: the group's connection is replaced (the staging
     /// pool is dropped with it and registered buffers re-register on
     /// their next use, as in any connection replacement), and the
     /// remote accepts into the group's protection domain, so the
-    /// group's tuples keep working over the new connection.
+    /// group's tuples keep working over the new connection. With the
+    /// session run here, its tuples re-request is done by the time
+    /// this returns — the fresh rkey of a re-granted revocable
+    /// region is already in the cache, one lookup away.
     ///
     /// The recovery path for a group whose connection has *failed*
     /// rather than merely gone stale: a queue pair error leaves the
     /// connection unusable, while a healthy metadata channel would
-    /// make [`Self::update`] merely refresh the tuples over it —
-    /// never touching the connection. Forgetting the channel here
-    /// forces the fresh session that replaces the connection.
-    pub fn reconnect(&self, group: u32) {
-        let mut sessions = self.sessions.borrow_mut();
-        if let Some(session) = sessions.get_mut(&group) {
+    /// make [`Self::join_and_fetch`] merely refresh the tuples over it —
+    /// never touching the connection. Dropping the channel forces
+    /// the fresh session that replaces the connection, and running
+    /// it here makes this call the whole recovery, complete when it
+    /// returns. A group that never joined gets a first session; a
+    /// failed attempt leaves the channel dropped, so the retry is
+    /// this call again.
+    pub fn reconnect(&self, group: u32) -> io::Result<()> {
+        if let Some(session) = self.sessions.borrow_mut().get_mut(&group) {
             session.channel = None;
         }
+        self.join_and_fetch(group)
     }
 
     /// Look up a remote memory region by its metadata.
@@ -1086,8 +1148,8 @@ impl RemoteMemoryProvider {
             .iter()
             .find(|region| group.is_none_or(|g| region.group == g))?;
         // The group's connection slot: the session's when one exists,
-        // a fresh empty one otherwise (reads through it fail: an
-        // update of the group is needed first).
+        // a fresh empty one otherwise (reads through it fail: a
+        // join_and_fetch of the group is needed first).
         let connection = self
             .sessions
             .borrow()
