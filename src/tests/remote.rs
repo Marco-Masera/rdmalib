@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
 
-use crate::readers::{CachedRegion, GroupConnection, GroupSession, RegisteredBuffer};
+use crate::clients::{CachedRegion, GroupConnection, GroupSession, RegisteredBuffer};
 use crate::*;
 
 fn metadata(name: &str, id: u32, size: usize) -> RemoteMemoryRegionMetadata {
@@ -34,9 +34,13 @@ fn region(elem_size: u32, elem_align: u32, elem_type: &str) -> RemoteMemoryRegio
 
 #[test]
 fn provider_starts_empty() {
-    let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
+    let provider = RemoteMemorySession::new(RemoteMemoryProviderAddr::default());
     assert!(provider.get_remote_mr_metadata().get_vec().is_empty());
-    assert!(provider.get_remote_mr(&metadata("missing", 0, 0), None).is_none());
+    assert!(
+        provider
+            .get_remote_mr(&metadata("missing", 0, 0), None)
+            .is_none()
+    );
     // Nothing connects until a join_and_fetch, and one without a
     // reachable remote fails here.
     assert!(provider.join_and_fetch(0).is_err());
@@ -44,7 +48,7 @@ fn provider_starts_empty() {
 
 #[test]
 fn reconnect_runs_the_session_itself() {
-    let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
+    let provider = RemoteMemorySession::new(RemoteMemoryProviderAddr::default());
 
     // Not a flag-drop: reconnect establishes a fresh session, all in
     // this call — on a group no session ever joined, a first session.
@@ -59,7 +63,7 @@ fn reconnect_runs_the_session_itself() {
 
 #[test]
 fn lookup_by_metadata_and_group() {
-    let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
+    let provider = RemoteMemorySession::new(RemoteMemoryProviderAddr::default());
     let heap = metadata("heap", 7, 12288);
     provider.metadata.borrow_mut().push(heap.clone());
     provider.regions.borrow_mut().insert(
@@ -91,25 +95,37 @@ fn lookup_by_metadata_and_group() {
 
     let grouped = provider.get_remote_mr(&heap, Some(3)).unwrap();
     assert_eq!(
-        (grouped.remote_addr, grouped.size, grouped.rkey, grouped.group),
+        (
+            grouped.remote_addr,
+            grouped.size,
+            grouped.rkey,
+            grouped.group
+        ),
         (0x2000, 8192, 2, 3)
     );
     assert_eq!((grouped.elem_size, grouped.elem_align), (8, 8));
 
     assert!(provider.get_remote_mr(&heap, Some(7)).is_none());
     // Same name, different id: a different region.
-    assert!(provider.get_remote_mr(&metadata("heap", 8, 12288), None).is_none());
+    assert!(
+        provider
+            .get_remote_mr(&metadata("heap", 8, 12288), None)
+            .is_none()
+    );
     assert_eq!(provider.get_remote_mr_metadata().get_vec(), &vec![heap]);
 }
 
 #[test]
 fn catalog_find_by_name_and_get_vec() {
-    let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
+    let provider = RemoteMemorySession::new(RemoteMemoryProviderAddr::default());
 
     // An empty catalog finds nothing: the error names what was
     // looked up.
     assert_eq!(
-        provider.get_remote_mr_metadata().find_by_name("heap").unwrap_err(),
+        provider
+            .get_remote_mr_metadata()
+            .find_by_name("heap")
+            .unwrap_err(),
         RegionNotFound {
             name: "heap".into()
         }
@@ -131,7 +147,7 @@ fn catalog_find_by_name_and_get_vec() {
 
 #[test]
 fn find_remote_by_name_resolves_and_reports() {
-    let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
+    let provider = RemoteMemorySession::new(RemoteMemoryProviderAddr::default());
 
     // No session has ever run and no region is catalogued: the name
     // is simply not there.
@@ -305,7 +321,10 @@ fn typed_write_bounds_and_alignment_are_checked_before_connecting() {
     // 2 u32s at element offset 1023 (bytes 4092..4100) exceed the
     // 4096-byte region.
     assert_eq!(
-        region.write_typed::<u32>(1023, &[0u32; 2]).unwrap_err().kind(),
+        region
+            .write_typed::<u32>(1023, &[0u32; 2])
+            .unwrap_err()
+            .kind(),
         io::ErrorKind::InvalidInput
     );
     // A misaligned region base (0x1002 here) is rejected for u32
@@ -321,12 +340,18 @@ fn typed_write_bounds_and_alignment_are_checked_before_connecting() {
         elem_type: "u32".into(),
     };
     assert_eq!(
-        misaligned.write_typed::<u32>(0, &[0u32; 1]).unwrap_err().kind(),
+        misaligned
+            .write_typed::<u32>(0, &[0u32; 1])
+            .unwrap_err()
+            .kind(),
         io::ErrorKind::InvalidInput
     );
     // A whole-buffer typed write of 2048 u32s exceeds the region.
     assert_eq!(
-        region.write_typed::<u32>(0, &[0u32; 2048]).unwrap_err().kind(),
+        region
+            .write_typed::<u32>(0, &[0u32; 2048])
+            .unwrap_err()
+            .kind(),
         io::ErrorKind::InvalidInput
     );
     // An element offset past the region's end, even with nothing to
@@ -375,17 +400,17 @@ fn typed_write_mismatch_with_the_registered_layout_is_rejected() {
 #[test]
 fn staging_capacity_is_configurable() {
     // The default: 1 MiB.
-    let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
+    let provider = RemoteMemorySession::new(RemoteMemoryProviderAddr::default());
     assert_eq!(provider.staging_capacity(), 1 << 20);
 
     // The builder tunes it...
     let tuned =
-        RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default()).with_staging_capacity(4 << 20);
+        RemoteMemorySession::new(RemoteMemoryProviderAddr::default()).with_staging_capacity(4 << 20);
     assert_eq!(tuned.staging_capacity(), 4 << 20);
     // ...and degenerate values are clamped to what a pool can be:
     // non-empty, and addressable by one RDMA operation.
     assert_eq!(
-        RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default())
+        RemoteMemorySession::new(RemoteMemoryProviderAddr::default())
             .with_staging_capacity(0)
             .staging_capacity(),
         1
@@ -410,7 +435,7 @@ fn staging_capacity_is_configurable() {
 
 #[test]
 fn register_buffer_needs_a_session_and_a_connection() {
-    let provider = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::default());
+    let provider = RemoteMemorySession::new(RemoteMemoryProviderAddr::default());
 
     // No session for the group yet: a join_and_fetch is needed first.
     let err = provider.register_buffer(0, vec![0u8; 8]).unwrap_err();
@@ -494,8 +519,6 @@ fn registered_buffer_operations_check_before_touching_the_device() {
         .read_into_registered(0, 4, &mut buffer)
         .unwrap_err();
     assert_ne!(err.kind(), io::ErrorKind::InvalidInput);
-    let err = u64_region
-        .write_from_registered(0, 4, &buffer)
-        .unwrap_err();
+    let err = u64_region.write_from_registered(0, 4, &buffer).unwrap_err();
     assert_ne!(err.kind(), io::ErrorKind::InvalidInput);
 }

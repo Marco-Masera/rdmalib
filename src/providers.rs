@@ -1,6 +1,6 @@
 //! Server side: memory regions shared with remote machines.
 //!
-//! [`SharedMemoryRegionProvider`] owns the registered regions, assigning
+//! [`SharedMemoryProvider`] owns the registered regions, assigning
 //! each a fresh id and handing out a [`SharedMemoryRegionHandle`] for
 //! continued access. Regions are shared as bytes ([`Self::register`])
 //! or as a `Vec` of any [`crate::RemoteSafe`] type
@@ -12,7 +12,7 @@
 //! choice and connecting over RDMA into the group's protection
 //! domain, then receiving the region catalog and the group's tuples.
 
-use std::any::{type_name, Any};
+use std::any::{Any, type_name};
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::io;
@@ -26,18 +26,18 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::meta::{Channel, Message, RegionDesc, TupleDesc, PROTOCOL_VERSION};
+use crate::RemoteSafe;
+use crate::meta::{Channel, Message, PROTOCOL_VERSION, RegionDesc, TupleDesc};
 use crate::rdma;
 use crate::rdma::is_flushed;
-use crate::RemoteSafe;
 
 /// A memory region to be shared with remote machines, as raw bytes.
 ///
 /// Owns the region's buffer. Registering the metadata with a
-/// [`SharedMemoryRegionProvider`] moves the buffer into the provider; a
+/// [`SharedMemoryProvider`] moves the buffer into the provider; a
 /// handle is returned for continued access. For a `Vec` of some other
 /// [`RemoteSafe`] element type, use
-/// [`SharedMemoryRegionProvider::register_typed`]. Deliberately not
+/// [`SharedMemoryProvider::register_typed`]. Deliberately not
 /// `Clone`: cloning would duplicate the region's memory.
 #[derive(Debug)]
 pub struct SharedMemoryRegionMetadata {
@@ -60,19 +60,19 @@ impl SharedMemoryRegionMetadata {
 /// Connection parameters of this node's memory provider service.
 ///
 /// Built by the node sharing memory and handed to
-/// [`SharedMemoryRegionProvider::new`]:
-/// [`SharedMemoryRegionProvider::serve`] binds both ports — the TCP
+/// [`SharedMemoryProvider::new`]:
+/// [`SharedMemoryProvider::serve`] binds both ports — the TCP
 /// port carries the metadata exchange, the RDMA port the memory
 /// traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SharedMemoryRegionProviderAddr {
+pub struct SharedMemoryProviderAddr {
     /// RDMA port the provider serves memory on.
     pub rdma_port: u16,
     /// Desired TCP port for the metadata exchange.
     pub tcp_port: u16,
 }
 
-impl SharedMemoryRegionProviderAddr {
+impl SharedMemoryProviderAddr {
     /// Describe this provider's RDMA and TCP ports.
     pub fn new(rdma_port: u16, tcp_port: u16) -> Self {
         Self {
@@ -90,7 +90,7 @@ type Owner = Rc<RefCell<Box<dyn Any>>>;
 
 /// Serves the memory regions shared with remote machines.
 ///
-/// Constructed from a [`SharedMemoryRegionProviderAddr`]. Regions are
+/// Constructed from a [`SharedMemoryProviderAddr`]. Regions are
 /// registered with [`Self::register`] (a `Vec<u8>`) or
 /// [`Self::register_typed`] (a `Vec` of any [`RemoteSafe`] type):
 /// each takes ownership of the buffer without copying it and assigns
@@ -111,8 +111,8 @@ type Owner = Rc<RefCell<Box<dyn Any>>>;
 /// [`Self::revoke_region`]/[`Self::grant_region`] can kill or re-grant
 /// with a completion-linearized bind.
 #[derive(Debug)]
-pub struct SharedMemoryRegionProvider {
-    addr: SharedMemoryRegionProviderAddr,
+pub struct SharedMemoryProvider {
+    addr: SharedMemoryProviderAddr,
     /// The state shared with the service thread: everything the
     /// metadata channel serves, and everything it needs to serve it.
     shared: Shared,
@@ -126,12 +126,12 @@ pub struct SharedMemoryRegionProvider {
     next_id: Cell<u32>,
 }
 
-/// Handle to a region registered with a [`SharedMemoryRegionProvider`].
+/// Handle to a region registered with a [`SharedMemoryProvider`].
 ///
 /// Grants read and write access to the region's buffer via [`Self::borrow`]
 /// and [`Self::borrow_mut`] — as `T`s for a region registered with
-/// [`SharedMemoryRegionProvider::register_typed`], as bytes for one
-/// registered with [`SharedMemoryRegionProvider::register`] (then `T`
+/// [`SharedMemoryProvider::register_typed`], as bytes for one
+/// registered with [`SharedMemoryProvider::register`] (then `T`
 /// is `u8`). The usual `RefCell` rule applies: only one borrow of a
 /// given buffer can be active at a time. The provider keeps working
 /// while a buffer is borrowed; it co-owns the buffer and keeps it
@@ -169,7 +169,7 @@ struct RegionInfo {
     elem_type: String,
     /// Whether the region is served to each group through a
     /// revocable memory window — the `revocable` flag of
-    /// [`SharedMemoryRegionProvider::register_typed`] — instead of a
+    /// [`SharedMemoryProvider::register_typed`] — instead of a
     /// plain registration. Captured at registration and never
     /// revisited: a region is born revocable or never.
     windowed: bool,
@@ -250,7 +250,7 @@ impl GroupBinding {
     }
 
     /// Whether the binding is a window one — the only kind
-    /// [`SharedMemoryRegionProvider::revoke_region`] can act on.
+    /// [`SharedMemoryProvider::revoke_region`] can act on.
     fn window(&self) -> Option<(&rdma::MemoryWindow, &rdma::MemoryRegion)> {
         match self {
             GroupBinding::Registration(_) => None,
@@ -259,11 +259,11 @@ impl GroupBinding {
     }
 }
 
-impl SharedMemoryRegionProvider {
+impl SharedMemoryProvider {
     /// Create a provider serving memory over `addr`'s RDMA port and
     /// exchanging metadata over its TCP port, once [`Self::serve`] is
     /// called.
-    pub fn new(addr: SharedMemoryRegionProviderAddr) -> Self {
+    pub fn new(addr: SharedMemoryProviderAddr) -> Self {
         Self {
             addr,
             shared: Shared {
@@ -462,7 +462,8 @@ impl SharedMemoryRegionProvider {
     /// stands — retry through a live connection of the group (its
     /// next session provides one).
     pub fn revoke_region(&self, id: u32, group: u32) -> io::Result<()> {
-        self.shared.window_operation(id, group, WindowOperation::Revoke)
+        self.shared
+            .window_operation(id, group, WindowOperation::Revoke)
     }
 
     /// Re-grant `group` access to region `id`: bind its window over
@@ -477,7 +478,8 @@ impl SharedMemoryRegionProvider {
     /// flushes the bind and leaves the previous binding standing,
     /// reported as an error to retry.
     pub fn grant_region(&self, id: u32, group: u32) -> io::Result<()> {
-        self.shared.window_operation(id, group, WindowOperation::Grant)
+        self.shared
+            .window_operation(id, group, WindowOperation::Grant)
     }
 
     /// Whether region `id`'s grants are window bindings — the
@@ -505,7 +507,7 @@ enum WindowOperation {
     Grant,
 }
 
-impl Drop for SharedMemoryRegionProvider {
+impl Drop for SharedMemoryProvider {
     /// Stop the service (and with it the open sessions), then
     /// deregister the tuples while the buffers they pin and the
     /// groups (whose protection domains the registrations belong to)
@@ -687,7 +689,10 @@ impl GroupEntry {
     /// only, so the contention is bounded, and the hold is what
     /// serializes window operations with group changes, exactly the
     /// ordering revocation wants.
-    fn bind_through<T>(&mut self, op: impl Fn(&rdma::Connection) -> io::Result<T>) -> io::Result<T> {
+    fn bind_through<T>(
+        &mut self,
+        op: impl Fn(&rdma::Connection) -> io::Result<T>,
+    ) -> io::Result<T> {
         let mut failure = None;
         let mut index = self.connections.len();
         while index > 0 {
@@ -703,9 +708,7 @@ impl GroupEntry {
             }
         }
         Err(failure.unwrap_or_else(|| {
-            io::Error::other(
-                "the group has no connection to post a window operation through",
-            )
+            io::Error::other("the group has no connection to post a window operation through")
         }))
     }
 }
@@ -752,7 +755,10 @@ impl Shared {
                 });
             }
         }
-        Ok((Message::Metadata { regions }, Message::Tuples { group, tuples }))
+        Ok((
+            Message::Metadata { regions },
+            Message::Tuples { group, tuples },
+        ))
     }
 }
 
@@ -780,7 +786,7 @@ impl ServiceThread {
 }
 
 /// The metadata service, started by
-/// [`SharedMemoryRegionProvider::serve`] on a thread of its own: it
+/// [`SharedMemoryProvider::serve`] on a thread of its own: it
 /// owns both listeners and runs the readers' rendezvous, one at a
 /// time.
 struct Service {

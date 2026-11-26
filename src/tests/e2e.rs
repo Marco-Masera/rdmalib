@@ -13,26 +13,30 @@ const TCP_PORT: u16 = 9917;
 #[ignore = "needs an RDMA device"]
 fn reader_reads_what_the_owner_shares() {
     // Owner: share a region and start the metadata service.
-    let owner = SharedMemoryRegionProvider::new(SharedMemoryRegionProviderAddr::new(
-        RDMA_PORT,
-        TCP_PORT,
-    ));
+    let owner = SharedMemoryProvider::new(SharedMemoryProviderAddr::new(RDMA_PORT, TCP_PORT));
     let handle = owner.register_typed("readings", vec![42u64, 43, 44], false);
     owner.serve().unwrap();
 
     // Reader: join group 0 and read the region back, element by
     // element over RDMA.
-    let reader = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::new(
-        "localhost",
-        RDMA_PORT,
-        TCP_PORT,
-    ));
+    let reader =
+        RemoteMemorySession::new(RemoteMemoryProviderAddr::new("localhost", RDMA_PORT, TCP_PORT));
     reader.join_and_fetch(0).unwrap();
     let catalog = reader.get_remote_mr_metadata();
     let regions = catalog.get_vec();
     assert_eq!(regions.len(), 1);
-    assert_eq!((regions[0].name.as_str(), regions[0].id), ("readings", handle.id()));
-    assert_eq!((regions[0].elem_size, regions[0].elem_align, regions[0].elem_type.as_str()), (8, 8, "u64"));
+    assert_eq!(
+        (regions[0].name.as_str(), regions[0].id),
+        ("readings", handle.id())
+    );
+    assert_eq!(
+        (
+            regions[0].elem_size,
+            regions[0].elem_align,
+            regions[0].elem_type.as_str()
+        ),
+        (8, 8, "u64")
+    );
 
     let region = reader.get_remote_mr(&regions[0], Some(0)).unwrap();
     assert_eq!(region.read_typed::<u64>(0, 3).unwrap(), vec![42, 43, 44]);
@@ -74,23 +78,19 @@ fn reader_writes_what_the_owner_shares() {
     // its own, so this runs back-to-back with the read test above.
     const RDMA_PORT: u16 = 18516;
     const TCP_PORT: u16 = 9918;
-    let owner = SharedMemoryRegionProvider::new(SharedMemoryRegionProviderAddr::new(
-        RDMA_PORT,
-        TCP_PORT,
-    ));
+    let owner = SharedMemoryProvider::new(SharedMemoryProviderAddr::new(RDMA_PORT, TCP_PORT));
     let handle = owner.register_typed("commands", vec![0u64, 0, 0, 0], false);
     owner.serve().unwrap();
 
     // Reader: join group 0 and write into the region, element-wise
     // over RDMA.
-    let reader = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::new(
-        "localhost",
-        RDMA_PORT,
-        TCP_PORT,
-    ));
+    let reader =
+        RemoteMemorySession::new(RemoteMemoryProviderAddr::new("localhost", RDMA_PORT, TCP_PORT));
     reader.join_and_fetch(0).unwrap();
     let catalog = reader.get_remote_mr_metadata();
-    let region = reader.get_remote_mr(&catalog.get_vec()[0], Some(0)).unwrap();
+    let region = reader
+        .get_remote_mr(&catalog.get_vec()[0], Some(0))
+        .unwrap();
 
     region.write_typed::<u64>(1, &[7, 8]).unwrap();
     // The owner sees the written elements...
@@ -138,10 +138,7 @@ fn staged_and_registered_transfers() {
     // operations travel in chunks.
     const BULK_ELEMS: usize = 640 * 1024;
 
-    let owner = SharedMemoryRegionProvider::new(SharedMemoryRegionProviderAddr::new(
-        RDMA_PORT,
-        TCP_PORT,
-    ));
+    let owner = SharedMemoryProvider::new(SharedMemoryProviderAddr::new(RDMA_PORT, TCP_PORT));
     let bulk: Vec<u32> = (0..BULK_ELEMS as u32).collect();
     let bulk_handle = owner.register_typed("bulk", bulk.clone(), false);
     let small_handle = owner.register_typed("small", vec![1u64, 2, 3], false);
@@ -151,11 +148,8 @@ fn staged_and_registered_transfers() {
     owner.register_typed("sweep", vec![0u8; 8192], false);
     owner.serve().unwrap();
 
-    let reader = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::new(
-        "localhost",
-        RDMA_PORT,
-        TCP_PORT,
-    ));
+    let reader =
+        RemoteMemorySession::new(RemoteMemoryProviderAddr::new("localhost", RDMA_PORT, TCP_PORT));
     reader.join_and_fetch(0).unwrap();
     let bulk_region = reader.find_remote_by_name("bulk", 0).unwrap();
     let small_region = reader.find_remote_by_name("small", 0).unwrap();
@@ -241,13 +235,24 @@ fn staged_and_registered_transfers() {
             || sweep_region.read_into(0, size, &mut scratch).unwrap(),
             SWEEP_ITERATIONS,
         );
-        let write = timed(|| sweep_region.write(0, &payload).unwrap(), SWEEP_ITERATIONS);
+        let write = timed(
+            || sweep_region.write(0, &payload).unwrap(),
+            SWEEP_ITERATIONS,
+        );
         let read_reg = timed(
-            || sweep_region.read_into_registered(0, size, &mut sweep_buf).unwrap(),
+            || {
+                sweep_region
+                    .read_into_registered(0, size, &mut sweep_buf)
+                    .unwrap()
+            },
             SWEEP_ITERATIONS,
         );
         let write_reg = timed(
-            || sweep_region.write_from_registered(0, size, &sweep_buf).unwrap(),
+            || {
+                sweep_region
+                    .write_from_registered(0, size, &sweep_buf)
+                    .unwrap()
+            },
             SWEEP_ITERATIONS,
         );
         let path = if size <= inline { "inline" } else { "pool" };
@@ -268,20 +273,19 @@ fn staged_and_registered_transfers() {
 fn registered_buffers_survive_a_reconnect() {
     const RDMA_PORT: u16 = 18518;
     const TCP_PORT: u16 = 9920;
-    let addr = SharedMemoryRegionProviderAddr::new(RDMA_PORT, TCP_PORT);
+    let addr = SharedMemoryProviderAddr::new(RDMA_PORT, TCP_PORT);
 
-    let owner = SharedMemoryRegionProvider::new(addr);
+    let owner = SharedMemoryProvider::new(addr);
     owner.register_typed("values", vec![7u64, 8, 9], false);
     owner.serve().unwrap();
 
-    let reader = RemoteMemoryProvider::new(RemoteMemoryProviderAddr::new(
-        "localhost",
-        RDMA_PORT,
-        TCP_PORT,
-    ));
+    let reader =
+        RemoteMemorySession::new(RemoteMemoryProviderAddr::new("localhost", RDMA_PORT, TCP_PORT));
     reader.join_and_fetch(0).unwrap();
     let catalog = reader.get_remote_mr_metadata();
-    let region = reader.get_remote_mr(&catalog.get_vec()[0], Some(0)).unwrap();
+    let region = reader
+        .get_remote_mr(&catalog.get_vec()[0], Some(0))
+        .unwrap();
     let mut buffer = reader.register_buffer_typed(0, vec![0u64; 3]).unwrap();
     region.read_into_registered(0, 3, &mut buffer).unwrap();
     assert_eq!(buffer.as_slice(), &[7, 8, 9]);
@@ -292,7 +296,7 @@ fn registered_buffers_survive_a_reconnect() {
     // RDMA
     // connection and protection domain.
     drop(owner);
-    let owner = SharedMemoryRegionProvider::new(addr);
+    let owner = SharedMemoryProvider::new(addr);
     let handle = owner.register_typed("values", vec![70u64, 80, 90], false);
     owner.serve().unwrap();
     assert!(reader.join_and_fetch(0).is_err());
@@ -301,7 +305,9 @@ fn registered_buffers_survive_a_reconnect() {
     // The buffer, registered in the old connection's domain,
     // re-registers on use — and works through the new one.
     let catalog = reader.get_remote_mr_metadata();
-    let region = reader.get_remote_mr(&catalog.get_vec()[0], Some(0)).unwrap();
+    let region = reader
+        .get_remote_mr(&catalog.get_vec()[0], Some(0))
+        .unwrap();
     region.read_into_registered(0, 3, &mut buffer).unwrap();
     assert_eq!(buffer.as_slice(), &[70, 80, 90]);
     region.write_from_registered(0, 3, &buffer).unwrap();

@@ -46,11 +46,10 @@ fn test_public_api() {
         // Writer node
 
         // Create the shared memory Provider. It's the manager object
-        let owner =
-            rdmalib::SharedMemoryRegionProvider::new(rdmalib::SharedMemoryRegionProviderAddr::new(
-                cluster.me().rdma_port,
-                cluster.me().tcp_port,
-            )); // RDMA, TCP ports
+        let owner = rdmalib::SharedMemoryProvider::new(rdmalib::SharedMemoryProviderAddr::new(
+            cluster.me().rdma_port,
+            cluster.me().tcp_port,
+        )); // RDMA, TCP ports
 
         // instantiate a buffer of 1000 elements of type Test
         let buffer: Vec<Test> = (0..1000)
@@ -85,7 +84,7 @@ fn test_public_api() {
 
         // Establish a connection to the writer
         let writer_info = cluster.node(0);
-        let reader = rdmalib::RemoteMemoryProvider::new(rdmalib::RemoteMemoryProviderAddr::new(
+        let reader = rdmalib::RemoteMemorySession::new(rdmalib::RemoteMemoryProviderAddr::new(
             writer_info.ip.clone(),
             writer_info.rdma_port,
             writer_info.tcp_port,
@@ -99,7 +98,9 @@ fn test_public_api() {
         // Catalog: set of regions shared by the writer - only one in this example
         let catalog = reader.get_remote_mr_metadata();
         // Get the region associated to the area. Some(0) is a self-assigned group for permissions
-        let region = reader.get_remote_mr(&catalog.get_vec()[0], Some(0)).unwrap();
+        let region = reader
+            .get_remote_mr(&catalog.get_vec()[0], Some(0))
+            .unwrap();
 
         // Read only 150 elements out of the 1000, from 100 to 149
         let smaller_buffer = region.read_typed::<Test>(100, 150).unwrap();

@@ -6,8 +6,8 @@
 //! (`[len][type][payload]`, little-endian, [`MAX_FRAME`] capped), the
 //! messages of the session conversation, and [`Channel`], a TCP
 //! stream speaking them. It is deliberately free of RDMA knowledge:
-//! the sessions of [`SharedMemoryRegionProvider`](crate::SharedMemoryRegionProvider)
-//! and [`RemoteMemoryProvider`](crate::RemoteMemoryProvider) drive
+//! the sessions of [`SharedMemoryProvider`](crate::SharedMemoryProvider)
+//! and [`RemoteMemorySession`](crate::RemoteMemorySession) drive
 //! it, each side interleaving the RDMA rendezvous where its half of
 //! the connection requires it.
 //!

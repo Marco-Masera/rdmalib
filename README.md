@@ -6,8 +6,12 @@ It provides abstraction to RDMA primitives for Rust applications, specifically f
 # Structure
 
 Targeting DM settings, the library is asimmetrical, separating who offers its local memory remotely (the **Provider**), and who accesses it (the **Client**):
-* `SharedMemoryRegionProvider` -> A construct that allows processes to share parts of their local memory.
-* `RemoteMemoryRegion` -> A construct that allows to access remote regions.
+**Provider**:
+* `SharedMemoryProvider` -> A construct that allows processes to share parts of their local memory.
+* `SharedMemoryRegionHandle` -> A handle to control a specific shared region.
+**Clients**:
+* `RemoteMemorySession` -> A connection to a remote SharedMemoryProvider.
+* `RemoteMemoryRegion` -> A construct that allows to access a specific remote region.
 
 That said, nothing forbids a single Node to play both roles, by creating instances of both constructs.
 
@@ -30,12 +34,12 @@ rdmalib::impl_remote_safe!(Test);
 ## Share a local buffer
 
 ```rust
-// Initialize the SharedMemoryRegionProvider struct
-let address = SharedMemoryRegionProviderAddr::new(
+// Initialize the SharedMemoryProvider struct
+let address = SharedMemoryProviderAddr::new(
 1010, //RDMA port
 2020, // TCP tcp_port
 );
-let shared_memory_provider = SharedMemoryRegionProvider::new(address);
+let shared_memory_provider = SharedMemoryProvider::new(address);
 shared_memory_provider.serve()?;
 
 // Define a memory region to share 
@@ -43,7 +47,7 @@ let mut buffer = vec![MyDataType; 256];
 // Share it 
 let handle: SharedMemoryRegionHandle<MyDataType> shared_memory_provider.register_typed(
     "MyBuffer", //Name for the memory region
-    buffer, // Now buffer is owned by the SharedMemoryRegionProvider
+    buffer, // Now buffer is owned by the SharedMemoryProvider
     false // access is not revocable
 );
 ```
@@ -59,7 +63,7 @@ let memory_node_addr = RemoteMemoryProviderAddr::new(
     1010, // RDMA port of the owner 
     2020, // TCP port of the owner
 )
-let remote_memory = RemoteMemoryProvider::new();
+let remote_memory = RemoteMemoryProviderAddr::new();
 remote_memory.join_and_fetch(0)?; // Join a group, fetch metadata
 
 // Connect to a region using the region name

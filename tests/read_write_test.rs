@@ -44,13 +44,15 @@ fn test_public_api() {
 
     if cluster.my_node == 0 {
         // Writer
-        let owner =
-            rdmalib::SharedMemoryRegionProvider::new(rdmalib::SharedMemoryRegionProviderAddr::new(
-                cluster.me().rdma_port,
-                cluster.me().tcp_port,
-            )); // RDMA, TCP ports
-        let handle =
-            owner.register_typed("tests", vec![Test { v: 1 }, Test { v: 2 }, Test { v: 3 }], false);
+        let owner = rdmalib::SharedMemoryProvider::new(rdmalib::SharedMemoryProviderAddr::new(
+            cluster.me().rdma_port,
+            cluster.me().tcp_port,
+        )); // RDMA, TCP ports
+        let handle = owner.register_typed(
+            "tests",
+            vec![Test { v: 1 }, Test { v: 2 }, Test { v: 3 }],
+            false,
+        );
         let _ = owner.serve().unwrap();
         // The provider is listening: let the readers connect.
         synch.synch().unwrap();
@@ -64,7 +66,7 @@ fn test_public_api() {
     } else {
         // Reader
         let writer = cluster.node(0);
-        let reader = rdmalib::RemoteMemoryProvider::new(rdmalib::RemoteMemoryProviderAddr::new(
+        let reader = rdmalib::RemoteMemorySession::new(rdmalib::RemoteMemoryProviderAddr::new(
             writer.ip.clone(),
             writer.rdma_port,
             writer.tcp_port,
@@ -73,7 +75,9 @@ fn test_public_api() {
         synch.synch().unwrap();
         reader.join_and_fetch(0).unwrap(); // session: greet, join group 0, RDMA rendezvous, tuples
         let catalog = reader.get_remote_mr_metadata();
-        let region = reader.get_remote_mr(&catalog.get_vec()[0], Some(0)).unwrap();
+        let region = reader
+            .get_remote_mr(&catalog.get_vec()[0], Some(0))
+            .unwrap();
         let tests = region.read_typed::<Test>(0, 3).unwrap(); // [Test { v: 1 }, Test { v: 2 }, Test { v: 3 }]
         assert_eq!(tests.iter().map(|t| t.v).collect::<Vec<_>>(), vec![1, 2, 3]);
         println!("Done!");

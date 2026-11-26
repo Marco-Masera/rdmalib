@@ -1,9 +1,9 @@
 //! Client side: handles to memory regions exported by a remote machine.
 //!
-//! [`RemoteMemoryProvider`] connects to a remote
-//! [`SharedMemoryRegionProvider`](crate::SharedMemoryRegionProvider)
+//! [`RemoteMemorySession`] connects to a remote
+//! [`SharedMemoryProvider`](crate::SharedMemoryProvider)
 //! and hands out [`RemoteMemoryRegion`]s to read from and write to.
-//! [`RemoteMemoryProvider::join_and_fetch`] runs a group's session over the
+//! [`RemoteMemorySession::join_and_fetch`] runs a group's session over the
 //! metadata channel — greeting, joining the group, connecting over
 //! RDMA (which the remote accepts into the group's protection
 //! domain), and receiving the region catalog and the group's tuples.
@@ -12,7 +12,7 @@
 //! deregistering cost kernel round trips and page pinning, an order
 //! of magnitude more than the operation itself. Instead, every group
 //! connection owns a registered **staging pool** (sized by
-//! [`RemoteMemoryProvider::with_staging_capacity`]) that the byte and
+//! [`RemoteMemorySession::with_staging_capacity`]) that the byte and
 //! typed paths bounce through — one local copy per operation, in
 //! pool-sized chunks for larger ones — and small writes travel
 //! inline, straight out of the caller's memory, needing nothing at
@@ -28,16 +28,16 @@ use std::io;
 use std::mem::{align_of, size_of};
 use std::rc::Rc;
 
-use crate::meta::{Channel, Message, TupleDesc, PROTOCOL_VERSION};
-use crate::rdma;
 use crate::RemoteSafe;
+use crate::meta::{Channel, Message, PROTOCOL_VERSION, TupleDesc};
+use crate::rdma;
 
 /// Default capacity of a group connection's staging pool, in bytes:
 /// 1 MiB. Operations larger than the pool travel in pool-sized
 /// chunks; a reader that knows it will issue larger operations can
 /// raise the capacity with
-/// [`RemoteMemoryProvider::with_staging_capacity`] or
-/// [`RemoteMemoryProvider::set_staging_capacity`].
+/// [`RemoteMemorySession::with_staging_capacity`] or
+/// [`RemoteMemorySession::set_staging_capacity`].
 const DEFAULT_STAGING_CAPACITY: usize = 1 << 20;
 
 /// A staging capacity to use: at least one byte (an empty pool
@@ -49,7 +49,7 @@ fn clamp_staging_capacity(bytes: usize) -> usize {
 
 /// The error a data operation reports when its group has no RDMA
 /// connection: a session — a successful
-/// [`RemoteMemoryProvider::join_and_fetch`] — is a prerequisite.
+/// [`RemoteMemorySession::join_and_fetch`] — is a prerequisite.
 fn no_connection() -> io::Error {
     io::Error::other(
         "the group has no RDMA connection: a successful join_and_fetch is required first",
@@ -62,7 +62,7 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 
 /// Data used to reach a remote machine running a memory provider.
 ///
-/// Built by the client and handed to [`RemoteMemoryProvider::new`].
+/// Built by the client and handed to [`RemoteMemorySession::new`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct RemoteMemoryProviderAddr {
     /// Address of the remote machine (IP or hostname).
@@ -92,7 +92,7 @@ impl RemoteMemoryProviderAddr {
 /// connects until the first join_and_fetch, keeping construction
 /// infallible.
 #[derive(Debug)]
-pub struct RemoteMemoryProvider {
+pub struct RemoteMemorySession {
     /// Where to reach the remote machine.
     addr: RemoteMemoryProviderAddr,
     /// Sessions by group, established by [`Self::join_and_fetch`]: the
@@ -117,7 +117,7 @@ pub struct RemoteMemoryProvider {
 #[derive(Debug)]
 pub(crate) struct GroupSession {
     /// The metadata channel, connected by the group's first
-    /// [`RemoteMemoryProvider::join_and_fetch`]; dropped when an exchange
+    /// [`RemoteMemorySession::join_and_fetch`]; dropped when an exchange
     /// fails, so the next join_and_fetch opens a fresh session.
     pub(crate) channel: Option<Channel>,
     /// The group's RDMA connection, established by the session's
@@ -161,7 +161,7 @@ pub(crate) struct GroupConnection {
     /// configuration at creation time.
     pub(crate) capacity: usize,
     /// Bumped whenever the connection is replaced (by a fresh session
-    /// in [`RemoteMemoryProvider::join_and_fetch`]): the staging pool is
+    /// in [`RemoteMemorySession::join_and_fetch`]): the staging pool is
     /// dropped with the old connection, and registered buffers see
     /// the bump and re-register into the new connection's domain.
     pub(crate) generation: u32,
@@ -169,7 +169,7 @@ pub(crate) struct GroupConnection {
 
 impl GroupConnection {
     /// A slot no session has filled yet: reads through it fail — a
-    /// successful [`RemoteMemoryProvider::join_and_fetch`] of the group is
+    /// successful [`RemoteMemorySession::join_and_fetch`] of the group is
     /// needed first.
     pub(crate) fn empty() -> Self {
         Self::with_capacity(DEFAULT_STAGING_CAPACITY)
@@ -237,9 +237,7 @@ impl GroupConnection {
         if staging.is_none() {
             *staging = Some(Self::create_staging(conn, *capacity)?);
         }
-        let stage = staging
-            .as_ref()
-            .expect("the staging pool was just created");
+        let stage = staging.as_ref().expect("the staging pool was just created");
         let capacity = stage.buf.len();
         let mut done = 0;
         while done < len {
@@ -248,9 +246,7 @@ impl GroupConnection {
             // SAFETY: the caller's `dst` spans `len` writable bytes,
             // and the read just filled the first `chunk` bytes of the
             // pool.
-            unsafe {
-                std::ptr::copy_nonoverlapping(stage.buf.as_ptr(), dst.add(done), chunk)
-            };
+            unsafe { std::ptr::copy_nonoverlapping(stage.buf.as_ptr(), dst.add(done), chunk) };
             done += chunk;
         }
         Ok(())
@@ -292,17 +288,13 @@ impl GroupConnection {
         if staging.is_none() {
             *staging = Some(Self::create_staging(conn, *capacity)?);
         }
-        let stage = staging
-            .as_mut()
-            .expect("the staging pool was just created");
+        let stage = staging.as_mut().expect("the staging pool was just created");
         let capacity = stage.buf.len();
         let mut done = 0;
         while done < len {
             let chunk = (len - done).min(capacity);
             // SAFETY: the caller's `src` spans `len` readable bytes.
-            unsafe {
-                std::ptr::copy_nonoverlapping(src.add(done), stage.buf.as_mut_ptr(), chunk)
-            };
+            unsafe { std::ptr::copy_nonoverlapping(src.add(done), stage.buf.as_mut_ptr(), chunk) };
             conn.write(&stage.mr, remote_addr + done as u64, rkey, chunk)?;
             done += chunk;
         }
@@ -330,8 +322,8 @@ pub(crate) struct CachedRegion {
 /// Metadata describing a memory region exported by a remote machine.
 ///
 /// Carried in the [`Catalog`] of
-/// [`RemoteMemoryProvider::get_remote_mr_metadata`]; pass it
-/// back to [`RemoteMemoryProvider::get_remote_mr`] to obtain the active
+/// [`RemoteMemorySession::get_remote_mr_metadata`]; pass it
+/// back to [`RemoteMemorySession::get_remote_mr`] to obtain the active
 /// region. The element layout is what the sharing side registered the
 /// region as: a typed read whose `T` does not match it fails instead
 /// of reading garbage.
@@ -352,11 +344,11 @@ pub struct RemoteMemoryRegionMetadata {
 }
 
 /// The catalog of the memory regions a remote machine has shared, as
-/// of this provider's last [`RemoteMemoryProvider::join_and_fetch`].
+/// of this provider's last [`RemoteMemorySession::join_and_fetch`].
 ///
 /// A snapshot owned by the caller: the regions it lists are
 /// [`RemoteMemoryRegionMetadata`] to pass to
-/// [`RemoteMemoryProvider::get_remote_mr`].
+/// [`RemoteMemorySession::get_remote_mr`].
 #[derive(Debug, Clone)]
 pub struct Catalog {
     regions: Vec<RemoteMemoryRegionMetadata>,
@@ -364,10 +356,7 @@ pub struct Catalog {
 
 impl Catalog {
     /// The region catalogued under `name`, or a [`RegionNotFound`].
-    pub fn find_by_name(
-        &self,
-        name: &str,
-    ) -> Result<&RemoteMemoryRegionMetadata, RegionNotFound> {
+    pub fn find_by_name(&self, name: &str) -> Result<&RemoteMemoryRegionMetadata, RegionNotFound> {
         self.regions
             .iter()
             .find(|entry| entry.name == name)
@@ -398,7 +387,7 @@ impl fmt::Display for RegionNotFound {
 
 impl std::error::Error for RegionNotFound {}
 
-/// Why [`RemoteMemoryProvider::find_remote_by_name`] cannot hand out a
+/// Why [`RemoteMemorySession::find_remote_by_name`] cannot hand out a
 /// region: no region of that name in the catalog, or the region has
 /// no binding for the group asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,7 +395,7 @@ pub enum GetRegionError {
     /// No region catalogued under the name.
     NotFound(RegionNotFound),
     /// The region is catalogued but has no binding for the group —
-    /// a [`RemoteMemoryProvider::join_and_fetch`] of the group
+    /// a [`RemoteMemorySession::join_and_fetch`] of the group
     /// materializes one.
     Unavailable { name: String, group: u32 },
 }
@@ -426,11 +415,11 @@ impl fmt::Display for GetRegionError {
 impl std::error::Error for GetRegionError {}
 
 /// An active memory region on the remote machine, as returned by
-/// [`RemoteMemoryProvider::get_remote_mr`].
+/// [`RemoteMemorySession::get_remote_mr`].
 ///
 /// Reads and writes go through the RDMA connection of the region's
 /// group — established by that group's
-/// [`RemoteMemoryProvider::join_and_fetch`] — as bytes ([`Self::read`],
+/// [`RemoteMemorySession::join_and_fetch`] — as bytes ([`Self::read`],
 /// [`Self::read_into`], [`Self::write`]) or as elements of any
 /// [`RemoteSafe`] type ([`Self::read_typed`], [`Self::read_into_typed`],
 /// [`Self::write_typed`]), provided that is the type the sharing side
@@ -587,7 +576,12 @@ impl RemoteMemoryRegion {
         }
         let mut slot = self.connection.borrow_mut();
         // SAFETY: `buf` spans `buf.len()` readable bytes.
-        slot.write_from_ptr(buf.as_ptr(), buf.len(), self.remote_addr + offset, self.rkey)
+        slot.write_from_ptr(
+            buf.as_ptr(),
+            buf.len(),
+            self.remote_addr + offset,
+            self.rkey,
+        )
     }
 
     /// Write `buf` to the remote region starting at element `offset`,
@@ -698,7 +692,12 @@ impl RemoteMemoryRegion {
     /// operation of the region makes: `T` matches the registered
     /// layout, the span lies within the region, and its start is
     /// aligned for `T`. `op` names the operation in error messages.
-    fn typed_span<T: RemoteSafe>(&self, op: &str, offset: u64, count: usize) -> io::Result<(u64, usize)> {
+    fn typed_span<T: RemoteSafe>(
+        &self,
+        op: &str,
+        offset: u64,
+        count: usize,
+    ) -> io::Result<(u64, usize)> {
         self.check_elem::<T>()?;
         let elem = size_of::<T>();
         let byte_offset = offset.saturating_mul(elem as u64);
@@ -743,8 +742,8 @@ impl RemoteMemoryRegion {
 /// A buffer registered once for the RDMA connection of one group: the
 /// zero-copy data path.
 ///
-/// Created by [`RemoteMemoryProvider::register_buffer`] or
-/// [`RemoteMemoryProvider::register_buffer_typed`] after the group's
+/// Created by [`RemoteMemorySession::register_buffer`] or
+/// [`RemoteMemorySession::register_buffer_typed`] after the group's
 /// session has run, and read and written through a
 /// [`RemoteMemoryRegion`] of the same group with
 /// [`RemoteMemoryRegion::read_into_registered`] and
@@ -755,7 +754,7 @@ impl RemoteMemoryRegion {
 /// The buffer never moves or reallocates: the registration pins its
 /// address. If the group's connection is replaced — a fresh session
 /// after the old one failed, run by
-/// [`RemoteMemoryProvider::join_and_fetch`] — the registration is remade in
+/// [`RemoteMemorySession::join_and_fetch`] — the registration is remade in
 /// the new connection's protection domain on the next use. `T`
 /// follows the library's element rules: a [`RemoteSafe`] type,
 /// matching the layout the sharing side registered the region as.
@@ -841,7 +840,7 @@ impl<T> fmt::Debug for RegisteredBuffer<T> {
     }
 }
 
-impl RemoteMemoryProvider {
+impl RemoteMemorySession {
     /// Prepare a provider for the remote machine described by `addr`.
     ///
     /// Nothing connects here: the first [`Self::join_and_fetch`] runs a
@@ -1001,10 +1000,11 @@ impl RemoteMemoryProvider {
         let metadata = catalog
             .find_by_name(name)
             .map_err(GetRegionError::NotFound)?;
-        self.get_remote_mr(metadata, Some(group)).ok_or(GetRegionError::Unavailable {
-            name: name.to_owned(),
-            group,
-        })
+        self.get_remote_mr(metadata, Some(group))
+            .ok_or(GetRegionError::Unavailable {
+                name: name.to_owned(),
+                group,
+            })
     }
 
     /// Join `group` and fetch the region metadata from the remote
@@ -1170,7 +1170,13 @@ impl RemoteMemoryProvider {
 
     /// Fill the caches from the exchange of `group`'s session.
     fn ingest(&self, group: u32, exchange: (Message, Message)) -> io::Result<()> {
-        let (Message::Metadata { regions }, Message::Tuples { group: served, tuples }) = exchange
+        let (
+            Message::Metadata { regions },
+            Message::Tuples {
+                group: served,
+                tuples,
+            },
+        ) = exchange
         else {
             return Err(io::Error::other(
                 "the remote replied with something other than the catalog and the tuples",
@@ -1202,9 +1208,7 @@ impl RemoteMemoryProvider {
             .collect();
         let mut active = self.regions.borrow_mut();
         for region in &regions {
-            let entry = active
-                .entry((region.name.clone(), region.id))
-                .or_default();
+            let entry = active.entry((region.name.clone(), region.id)).or_default();
             entry.retain(|cached| cached.group != group);
             if let Some(tuple) = tuples_by_id.get(&region.id) {
                 entry.push(CachedRegion {

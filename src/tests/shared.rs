@@ -1,7 +1,7 @@
 use crate::*;
 
-fn provider() -> SharedMemoryRegionProvider {
-    SharedMemoryRegionProvider::new(SharedMemoryRegionProviderAddr::new(18515, 9125))
+fn provider() -> SharedMemoryProvider {
+    SharedMemoryProvider::new(SharedMemoryProviderAddr::new(18515, 9125))
 }
 
 #[repr(C)]
@@ -27,8 +27,10 @@ fn register_assigns_sequential_ids() {
 #[test]
 fn tuples_need_an_accepted_group() {
     let provider = provider();
-    let handle =
-        provider.register(SharedMemoryRegionMetadata::new("heap", vec![0u8; 4096]), false);
+    let handle = provider.register(
+        SharedMemoryRegionMetadata::new("heap", vec![0u8; 4096]),
+        false,
+    );
 
     // No reader has been accepted into group 0, so no group exists
     // yet: no tuple is served. (Creating real tuples requires RDMA
@@ -43,7 +45,10 @@ fn tuples_need_an_accepted_group() {
 #[test]
 fn buffer_read_write_via_handle() {
     let provider = provider();
-    let handle = provider.register(SharedMemoryRegionMetadata::new("heap", vec![1, 2, 3, 4]), false);
+    let handle = provider.register(
+        SharedMemoryRegionMetadata::new("heap", vec![1, 2, 3, 4]),
+        false,
+    );
 
     assert_eq!(*handle.borrow(), [1, 2, 3, 4]);
     handle.borrow_mut()[0] = 9;

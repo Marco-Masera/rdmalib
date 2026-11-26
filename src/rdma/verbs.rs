@@ -1035,7 +1035,7 @@ impl ProtectionDomain {
     /// ("memory management operation error") and the posting queue
     /// pair goes to ERROR, flushing everything after it. Shared
     /// regions registered revocable — the `revocable` flag of
-    /// `SharedMemoryRegionProvider::register_typed` — register
+    /// `SharedMemoryProvider::register_typed` — register
     /// their backing this way.
     pub fn register_window_target(&self, addr: u64, size: usize) -> io::Result<MemoryRegion> {
         self.register_access(
